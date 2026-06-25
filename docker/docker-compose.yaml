@@ -80,8 +80,20 @@ services:
     # not yet implemented. Override GATEWAY_WORKERS only once that is in place.
     command: sh -c "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${GATEWAY_WORKERS:-1}"
     volumes:
-      - ${DEER_FLOW_CONFIG_PATH}:/app/backend/config.yaml:ro
-      - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
+      # config.yaml + extensions_config.json are mounted via their PARENT DIRECTORY
+      # (the project root, ../ from this compose file) rather than as single files.
+      # A single-file bind mount pins the file's inode at container start; editors
+      # that save atomically (write temp + rename) swap the inode, so the running
+      # container keeps serving the PRE-EDIT file until it is recreated. A directory
+      # mount resolves the path fresh on each read, so config edits hot-reload as
+      # intended (get_app_config() re-reads on content change) with no restart.
+      # Read-only. The container reads the two files via DEER_FLOW_CONFIG_PATH /
+      # DEER_FLOW_EXTENSIONS_CONFIG_PATH below, which point into this mount.
+      # NOTE: this exposes the project root (incl. .git) read-only inside the
+      # gateway. All .env secrets are already injected via env_file below, so this
+      # adds no material secret exposure. To avoid mounting the repo at all, move
+      # the two config files into a dedicated dir and mount only that instead.
+      - ..:/app/deer-flow-runtime:ro
       - ../skills:/app/skills:ro
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow
       # DooD: the host Docker socket is NOT mounted by default. It is added only
@@ -100,8 +112,10 @@ services:
       - CI=true
       - DEER_FLOW_PROJECT_ROOT=/app
       - DEER_FLOW_HOME=/app/backend/.deer-flow
-      - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml
-      - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/backend/extensions_config.json
+      # Point at the parent-directory mount (see volumes above) so atomic-save
+      # edits to config.yaml / extensions_config.json hot-reload without a restart.
+      - DEER_FLOW_CONFIG_PATH=/app/deer-flow-runtime/config.yaml
+      - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/deer-flow-runtime/extensions_config.json
       - DEER_FLOW_CHANNELS_LANGGRAPH_URL=${DEER_FLOW_CHANNELS_LANGGRAPH_URL:-http://gateway:8001/api}
       - DEER_FLOW_CHANNELS_GATEWAY_URL=${DEER_FLOW_CHANNELS_GATEWAY_URL:-http://gateway:8001}
       - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
