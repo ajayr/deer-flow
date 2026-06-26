@@ -28,6 +28,10 @@
 | `docker/nginx/nginx.conf` | `map $http_x_forwarded_proto $forwarded_proto` + every proxy block uses `X-Forwarded-Proto $forwarded_proto` — so login works behind the Pangolin TLS proxy (else Gateway 403 "Cross-site auth request denied"). Falls back to `$scheme` when nginx is the TLS edge. | `40cbf17f` |
 | `frontend/next.config.js` | Local change — currently **uncommitted**; review and commit before upgrading or it may block/lose on merge. | — |
 
+**New local files (net-new; survive `git merge` unless upstream adds the same path):**
+- `backend/packages/harness/deerflow/community/crawl4ai/` — self-hosted **Crawl4AI** `web_fetch` provider (replaces Jina; see section 4). Added by this deployment.
+- `docker/docker-compose.crawl4ai.yaml` — standalone Crawl4AI container (own lifecycle; **not** wired into `deploy.sh`).
+
 ## 2. Safe upgrade procedure
 1. **Snapshot:** `git status` — commit or stash any new local edits first (e.g. `frontend/next.config.js`).
 2. **Merge upstream INTO `main`** (don't `reset --hard` / `checkout` over local edits — that silently drops them):
@@ -54,6 +58,9 @@ docker exec deer-flow-gateway sh -c 'cd /app/backend && PYTHONPATH=. uv run pyth
 
 # Public login works (no 403)
 curl -sI "$(grep -m1 '^GATEWAY_CORS_ORIGINS=' .env | cut -d= -f2)" | head -1
+
+# web_fetch provider = self-hosted Crawl4AI, end-to-end (expect markdown, not an error)
+docker exec deer-flow-gateway sh -c 'cd /app/backend && PYTHONPATH=. uv run python -c "import asyncio; from deerflow.community.crawl4ai.tools import web_fetch_tool; print(asyncio.run(web_fetch_tool.ainvoke(\"https://example.com\"))[:200])"'
 ```
 
 ## 4. Gotchas & fallbacks
@@ -61,3 +68,4 @@ curl -sI "$(grep -m1 '^GATEWAY_CORS_ORIGINS=' .env | cut -d= -f2)" | head -1
 - **MiniMax can't see images?** Vision requires the gateway route **`ollamacloud/minimax-m3`** — the bare `minimax` alias and `ollamapro/minimax-m3` are **text-only** (silently ignore images). Ollama Cloud retires models periodically; if vision breaks, re-probe routes against the gateway with an **unguessable** test image (random digits — text-only models false-pass red/blue by guessing). Plain `langchain_openai:ChatOpenAI` is correct here (gateway returns reasoning as `reasoning_content`; do **not** switch to `PatchedChatMiniMax`).
 - **Login 403 / cookies not Secure after upgrade?** The nginx `X-Forwarded-Proto` map was likely lost in the merge — re-apply it. `GATEWAY_CORS_ORIGINS` in `.env` is a partial backstop.
 - **Gateway env interpolation errors on recreate?** You ran `docker compose up` directly instead of `scripts/deploy.sh` — the `${DEER_FLOW_*}` vars and persisted secrets come from deploy.sh; always recreate through it.
+- **`web_fetch` via self-hosted Crawl4AI.** `config.yaml` → `tools` → `web_fetch` uses `deerflow.community.crawl4ai.tools:web_fetch_tool` with `base_url: http://host.docker.internal:11235`. The server is the **standalone** `crawl4ai` container: start it with `docker compose -f docker/docker-compose.crawl4ai.yaml up -d` (it is NOT started by `deploy.sh`/`make up`). If `web_fetch` returns `Error: Crawl4AI ...`, check the container is up (`docker ps --filter name=crawl4ai`, `curl -fsS http://localhost:11235/health`). Jina remains as a commented fallback in `config.yaml` (its `JINA_API_KEY` in `.env` is the path that was failing). Adding the new provider module requires a **gateway rebuild** (`make up`) — config edits alone hot-reload, but new Python code does not.
