@@ -235,7 +235,7 @@ tools:
 
 **Built-in Tools**:
 - `web_search` - Search the web (DuckDuckGo, Tavily, Brave, Exa, InfoQuest, Firecrawl, fastCRW, GroundRoute)
-- `web_fetch` - Fetch web pages (Jina AI, Exa, InfoQuest, Firecrawl, fastCRW, GroundRoute)
+- `web_fetch` - Fetch web pages (Jina AI, Crawl4AI, Exa, InfoQuest, Firecrawl, fastCRW, GroundRoute)
 - `image_search` - Search for reference images (DuckDuckGo, InfoQuest, Serper)
 - `ls` - List directory contents
 - `read_file` - Read file contents
