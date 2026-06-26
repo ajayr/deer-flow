@@ -1,0 +1,27 @@
+# DeerFlow — Standalone Crawl4AI server for the web_fetch provider (LOCAL DEPLOYMENT)
+#
+# NOT part of the main stack and NOT referenced by scripts/deploy.sh. Crawl4AI
+# runs on its own lifecycle so it stays decoupled from the upstream-tracked
+# docker-compose.yaml / deploy.sh (minimizes merge surface — see root CLAUDE.md).
+#
+# Start:   docker compose -f docker/docker-compose.crawl4ai.yaml up -d
+# Stop:    docker compose -f docker/docker-compose.crawl4ai.yaml down
+# Health:  curl -fsS http://localhost:11235/health
+#
+# The gateway reaches this server at http://host.docker.internal:11235
+# (config.yaml -> tools -> web_fetch -> base_url). The gateway service already
+# declares extra_hosts host.docker.internal and exempts it from NO_PROXY, so no
+# edits to docker-compose.yaml are required.
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:0.8.6
+    container_name: crawl4ai
+    ports:
+      - "11235:11235"
+    shm_size: "1g"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:11235/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
