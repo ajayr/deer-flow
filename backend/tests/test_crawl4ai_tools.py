@@ -126,3 +126,80 @@ class TestCrawl4AiClient:
 
             headers = mock_ctx.post.call_args.kwargs["headers"]
             assert "Authorization" not in headers
+
+
+@pytest.mark.asyncio
+class TestCrawl4AiTools:
+    """Tests for the Crawl4AI tool functions."""
+
+    @patch("deerflow.community.crawl4ai.tools._get_crawl4ai_client")
+    async def test_web_fetch_tool_success(self, mock_get_client):
+        from deerflow.community.crawl4ai import tools
+
+        mock_client = MagicMock()
+        mock_client.fetch_markdown = AsyncMock(return_value="# Title\n\nContent")
+        mock_get_client.return_value = mock_client
+
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=None):
+            result = await tools.web_fetch_tool.ainvoke("https://example.com/article")
+
+        assert result == "# Title\n\nContent"
+        assert "Error:" not in result
+
+    @patch("deerflow.community.crawl4ai.tools._get_crawl4ai_client")
+    async def test_web_fetch_tool_truncates_to_4096(self, mock_get_client):
+        from deerflow.community.crawl4ai import tools
+
+        mock_client = MagicMock()
+        mock_client.fetch_markdown = AsyncMock(return_value="x" * 5000)
+        mock_get_client.return_value = mock_client
+
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=None):
+            result = await tools.web_fetch_tool.ainvoke("https://example.com")
+
+        assert len(result) == 4096
+
+    @patch("deerflow.community.crawl4ai.tools._get_crawl4ai_client")
+    async def test_web_fetch_tool_error_passthrough(self, mock_get_client):
+        from deerflow.community.crawl4ai import tools
+
+        mock_client = MagicMock()
+        mock_client.fetch_markdown = AsyncMock(return_value="Error: Crawl4AI returned empty markdown")
+        mock_get_client.return_value = mock_client
+
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=None):
+            result = await tools.web_fetch_tool.ainvoke("https://example.com")
+
+        assert result.startswith("Error:")
+
+    @patch("deerflow.community.crawl4ai.tools._get_crawl4ai_client")
+    async def test_web_fetch_tool_exception(self, mock_get_client):
+        from deerflow.community.crawl4ai import tools
+
+        mock_client = MagicMock()
+        mock_client.fetch_markdown = AsyncMock(side_effect=Exception("boom"))
+        mock_get_client.return_value = mock_client
+
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=None):
+            result = await tools.web_fetch_tool.ainvoke("https://example.com")
+
+        assert result.startswith("Error:")
+
+    async def test_get_crawl4ai_client_reads_config(self):
+        from deerflow.community.crawl4ai import tools
+
+        fake_cfg = {"base_url": "http://host.docker.internal:11235", "timeout_s": 45}
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=fake_cfg):
+            client = tools._get_crawl4ai_client()
+
+        assert client.base_url == "http://host.docker.internal:11235"
+        assert client.timeout_s == 45.0
+
+    async def test_get_crawl4ai_client_defaults_when_unconfigured(self):
+        from deerflow.community.crawl4ai import tools
+
+        with patch("deerflow.community.crawl4ai.tools._get_tool_config", return_value=None):
+            client = tools._get_crawl4ai_client()
+
+        assert client.base_url == "http://localhost:11235"
+        assert client.timeout_s == 30.0
