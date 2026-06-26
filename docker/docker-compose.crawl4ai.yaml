@@ -1,27 +1,43 @@
-# DeerFlow — Standalone Crawl4AI server for the web_fetch provider (LOCAL DEPLOYMENT)
+# DeerFlow — Crawl4AI server for the web_fetch provider (LOCAL DEPLOYMENT)
 #
-# NOT part of the main stack and NOT referenced by scripts/deploy.sh. Crawl4AI
-# runs on its own lifecycle so it stays decoupled from the upstream-tracked
-# docker-compose.yaml / deploy.sh (minimizes merge surface — see root CLAUDE.md).
+# Own lifecycle (own compose file, NOT referenced by scripts/deploy.sh), but it
+# ATTACHES to DeerFlow's existing internal docker network so the gateway reaches
+# it by service name with NO published host port. Crawl4AI runs unauthenticated
+# (JWT off) and will fetch ANY URL, so it must never be exposed on a host
+# interface — keeping it network-internal is the security boundary. (Also keeps
+# merge surface at zero: no edits to the upstream-tracked docker-compose.yaml /
+# deploy.sh / nginx.conf.)
+#
+# Requires DeerFlow's network to exist (it does whenever the stack is up):
+#   external network `deer-flow_deer-flow` (compose project `deer-flow`).
+#   If you renamed the project, update the `name:` under `networks:` below to
+#   match `docker network ls | grep deer-flow`.
 #
 # Start:   docker compose -f docker/docker-compose.crawl4ai.yaml up -d
 # Stop:    docker compose -f docker/docker-compose.crawl4ai.yaml down
-# Health:  curl -fsS http://localhost:11235/health
+# Health:  docker exec crawl4ai curl -fsS http://localhost:11235/health
+#          (no host port is published — not reachable from the host directly)
 #
-# The gateway reaches this server at http://host.docker.internal:11235
-# (config.yaml -> tools -> web_fetch -> base_url). The gateway service already
-# declares extra_hosts host.docker.internal and exempts it from NO_PROXY, so no
-# edits to docker-compose.yaml are required.
+# The gateway reaches this server at http://crawl4ai:11235 over the shared
+# network (config.yaml -> tools -> web_fetch -> base_url), mirroring how
+# DeerFlow's own browserless example addresses a Docker service by name.
 services:
   crawl4ai:
     image: unclecode/crawl4ai:0.8.6
     container_name: crawl4ai
-    ports:
-      - "11235:11235"
+    # No `ports:` — deliberately NOT published to the host. Reachable only from
+    # containers on the deer-flow network (i.e. the gateway), never externally.
     shm_size: "1g"
     restart: unless-stopped
+    networks:
+      - deer-flow
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:11235/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+networks:
+  deer-flow:
+    external: true
+    name: deer-flow_deer-flow
