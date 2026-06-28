@@ -9,6 +9,9 @@ from .crawl4ai_client import Crawl4AiClient
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://localhost:11235"
+DEFAULT_TIMEOUT_S = 30
+DEFAULT_FILTER = "fit"
+VALID_FILTERS = ("fit", "raw", "bm25", "llm")
 
 
 def _get_tool_config(tool_name: str) -> dict | None:
@@ -20,16 +23,53 @@ def _get_tool_config(tool_name: str) -> dict | None:
     return extras if extras is not None else {}
 
 
-def _get_crawl4ai_client() -> Crawl4AiClient:
-    cfg = _get_tool_config("web_fetch")
+def _coerce_timeout(value: object, default: int) -> float:
+    """Coerce a config timeout into seconds, falling back to ``default`` on bad input.
+
+    Mirrors ``jina_ai._coerce_timeout``: booleans and non-numeric strings fall
+    back to the default so e.g. ``timeout: off`` (YAML ``False``) does not become
+    ``0.0`` and time out every request against a healthy server.
+    """
+    if isinstance(value, bool):
+        return float(default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            logger.warning("Crawl4AI web_fetch: invalid timeout %r in config; using %ss", value, default)
+    return float(default)
+
+
+def _coerce_filter(value: object) -> str:
+    """Normalize and validate the markdown filter, falling back to the default.
+
+    Catches typos / stale values (e.g. ``FIt``, ``fit_content``) at config-read
+    time instead of letting them reach the server as an opaque HTTP 400.
+    """
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_FILTERS:
+            return normalized
+        logger.warning("Crawl4AI web_fetch: unknown filter %r in config; using %r (valid: %s)", value, DEFAULT_FILTER, ", ".join(VALID_FILTERS))
+    return DEFAULT_FILTER
+
+
+def _build_client(cfg: dict | None) -> Crawl4AiClient:
+    """Build a ``Crawl4AiClient`` from an already-read ``web_fetch`` config dict.
+
+    Takes the config as an argument (rather than reading it again) so a single
+    invocation reads ``get_app_config()`` exactly once and cannot split across a
+    concurrent hot-reload.
+    """
     base_url = DEFAULT_BASE_URL
     token = ""
-    timeout_s = 30.0
+    timeout_s: float = float(DEFAULT_TIMEOUT_S)
     if cfg is not None:
         base_url = cfg.get("base_url", base_url)
         token = cfg.get("token", token)
-        raw = cfg.get("timeout_s", timeout_s)
-        timeout_s = float(raw) if not isinstance(raw, float) else raw
+        timeout_s = _coerce_timeout(cfg.get("timeout"), DEFAULT_TIMEOUT_S)
     return Crawl4AiClient(base_url=base_url, token=token, timeout_s=timeout_s)
 
 
@@ -45,12 +85,9 @@ async def web_fetch_tool(url: str) -> str:
         url: The URL to fetch the contents of.
     """
     try:
-        cfg = _get_tool_config("web_fetch")
-        filter_mode = "fit"
-        if cfg is not None:
-            filter_mode = cfg.get("filter", filter_mode)
-
-        client = _get_crawl4ai_client()
+        cfg = _get_tool_config("web_fetch")  # read config once; pass the values down
+        filter_mode = _coerce_filter(cfg.get("filter") if cfg is not None else None)
+        client = _build_client(cfg)
         markdown = await client.fetch_markdown(url, filter_mode=filter_mode)
 
         if markdown.startswith("Error:"):

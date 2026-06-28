@@ -594,6 +594,6 @@ WEB_FETCH_PROVIDERS: list[WebProvider] = [
         use="deerflow.community.crawl4ai.tools:web_fetch_tool",
         env_var=None,
         tool_name="web_fetch",
-        extra_config={"base_url": "http://localhost:11235", "timeout_s": 30},
+        extra_config={"base_url": "http://localhost:11235", "timeout": 30},
     ),
 ]

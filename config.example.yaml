@@ -674,7 +674,7 @@ tools:
   #   group: web
   #   use: deerflow.community.crawl4ai.tools:web_fetch_tool
   #   base_url: http://localhost:11235   # Crawl4AI server URL (Docker: http://crawl4ai:11235)
-  #   timeout_s: 30                       # Request timeout in seconds
+  #   timeout: 30                         # Request timeout in seconds
   #   # filter: fit                       # Markdown filter: fit (default) | raw | bm25 | llm
   #   # token: $CRAWL4AI_TOKEN            # Bearer token (only if the server has JWT auth enabled)
 

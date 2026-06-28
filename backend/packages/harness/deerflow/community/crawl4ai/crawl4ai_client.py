@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -37,7 +38,12 @@ class Crawl4AiClient:
                 if resp.status_code != 200:
                     return f"Error: Crawl4AI HTTP {resp.status_code}: {resp.text[:200]}"
 
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    content_type = resp.headers.get("content-type", "unknown")
+                    return f"Error: Crawl4AI returned a non-JSON 200 response (content-type: {content_type}): {resp.text[:200]}"
+
                 if not data.get("success", False):
                     return f"Error: Crawl4AI reported failure for {url}"
 
