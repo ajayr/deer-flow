@@ -25,6 +25,11 @@ const config = {
     defaultLocale: "en",
   },
   devIndicators: false,
+  // Allow Next.js (dev) to serve /_next/* dev resources (HMR, RSC payloads,
+  // dev chunks) when DeerFlow is reached over the LAN, not just localhost.
+  // Without this, Next.js 16 blocks cross-origin dev-resource requests by
+  // Host and pages hang on a loading screen when accessed via the host IP.
+  allowedDevOrigins: ["10.20.31.204", "localhost", "127.0.0.1"],
   async rewrites() {
     const rewrites = [];
     const gatewayURL = getInternalServiceURL(
