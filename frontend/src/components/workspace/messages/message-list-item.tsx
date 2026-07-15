@@ -11,7 +11,6 @@ import {
   useMemo,
   useState,
   useEffect,
-  type AnchorHTMLAttributes,
   type ImgHTMLAttributes,
 } from "react";
 
@@ -32,22 +31,38 @@ import {
   upsertFeedback,
   type FeedbackData,
 } from "@/core/api/feedback";
-import { resolveArtifactURL } from "@/core/artifacts/utils";
+import {
+  resolveArtifactURL,
+  resolveMessageImageURL,
+} from "@/core/artifacts/utils";
+import { extractCitationSources } from "@/core/citations/sources";
 import { useI18n } from "@/core/i18n/hooks";
 import {
   extractContentFromMessage,
   extractReasoningContentFromMessage,
+  getMessageCopyData,
   parseUploadedFiles,
   stripUploadedFilesTag,
   type FileInMessage,
 } from "@/core/messages/utils";
 import { useRehypeSplitWordsIntoSpans } from "@/core/rehype";
+import { readReferenceMessageContexts } from "@/core/sidecar";
+import {
+  parseSlashSkillReference,
+  resolveSlashSkillDisplay,
+} from "@/core/skills";
+import { useSkills } from "@/core/skills/hooks";
 import { SafeReasoningContent } from "@/core/streamdown/components";
 import { cn } from "@/lib/utils";
 
+import { WorkspaceChangeBadge } from "../changes";
+import { CitationSourcesPanel } from "../citations/citation-sources-panel";
 import { CopyButton } from "../copy-button";
+import { ReferenceAttachmentSummary } from "../sidecar/reference-attachments";
+import { SlashSkillChip } from "../slash-skill-chip";
 
 import { MarkdownContent } from "./markdown-content";
+import { createMarkdownLinkComponent } from "./markdown-link";
 
 function FeedbackButtons({
   threadId,
@@ -123,6 +138,7 @@ export function MessageListItem({
   feedback,
   runId,
   threadId,
+  artifactPaths = [],
   showCopyButton = true,
   turnStartTime,
 }: {
@@ -130,6 +146,7 @@ export function MessageListItem({
   message: Message;
   isLoading?: boolean;
   threadId: string;
+  artifactPaths?: readonly string[];
   feedback?: FeedbackData | null;
   runId?: string;
   showCopyButton?: boolean;
@@ -146,6 +163,8 @@ export function MessageListItem({
         message={message}
         isLoading={isLoading}
         threadId={threadId}
+        artifactPaths={artifactPaths}
+        runId={runId}
         turnStartTime={turnStartTime}
       />
       {!isLoading && showCopyButton && (
@@ -158,13 +177,7 @@ export function MessageListItem({
           )}
         >
           <div className="pointer-events-auto flex gap-1">
-            <CopyButton
-              clipboardData={
-                extractContentFromMessage(message) ??
-                extractReasoningContentFromMessage(message) ??
-                ""
-              }
-            />
+            <CopyButton clipboardData={getMessageCopyData(message)} />
             {feedback !== undefined && runId && threadId && (
               <FeedbackButtons
                 threadId={threadId}
@@ -186,10 +199,12 @@ function MessageImage({
   src,
   alt,
   threadId,
+  artifactPaths,
   maxWidth = "90%",
   ...props
 }: React.ImgHTMLAttributes<HTMLImageElement> & {
   threadId: string;
+  artifactPaths: readonly string[];
   maxWidth?: string;
 }) {
   if (!src) return null;
@@ -200,7 +215,7 @@ function MessageImage({
     return <img className={imgClassName} src={src} alt={alt} {...props} />;
   }
 
-  const url = src.startsWith("/mnt/") ? resolveArtifactURL(src, threadId) : src;
+  const url = resolveMessageImageURL(src, threadId, artifactPaths);
 
   return (
     <a href={url} target="_blank" rel="noopener noreferrer">
@@ -211,17 +226,57 @@ function MessageImage({
 
 const clientTurnDurations = new Map<string, number>();
 
+function HumanMessageText({ content }: { content: string }) {
+  // `parseSlashSkillReference` is a pure regex gate (no data subscription), so
+  // the overwhelmingly common plain-text human message never subscribes to the
+  // skills query. Only a message that literally looks like a `/skill …`
+  // activation mounts `HumanSlashSkillText`, which owns the `useSkills()`
+  // lookup. This keeps a skill-enabled toggle from re-rendering every human
+  // turn — only the few slash-candidate turns react to catalog changes.
+  const reference = useMemo(() => parseSlashSkillReference(content), [content]);
+
+  if (!reference) {
+    return <div className="break-words whitespace-pre-wrap">{content}</div>;
+  }
+
+  return <HumanSlashSkillText content={content} />;
+}
+
+function HumanSlashSkillText({ content }: { content: string }) {
+  const { skills } = useSkills();
+  const slashSkill = resolveSlashSkillDisplay(content, skills);
+
+  if (!slashSkill) {
+    return <div className="break-words whitespace-pre-wrap">{content}</div>;
+  }
+
+  return (
+    <div className="flex max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+      <SlashSkillChip name={slashSkill.name} />
+      {slashSkill.remainingText && (
+        <span className="min-w-0 flex-1 break-words whitespace-pre-wrap">
+          {slashSkill.remainingText}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function MessageContent_({
   className,
   message,
   isLoading = false,
   threadId,
+  artifactPaths,
+  runId,
   turnStartTime,
 }: {
   className?: string;
   message: Message;
   isLoading?: boolean;
   threadId: string;
+  artifactPaths: readonly string[];
+  runId?: string;
   turnStartTime?: number | null;
 }) {
   const rehypePlugins = useRehypeSplitWordsIntoSpans(isLoading);
@@ -243,7 +298,7 @@ function MessageContent_({
       clientTurnDurations.set(`${threadId}:${message.id}`, rawTurnDuration);
       setCachedDuration(rawTurnDuration);
     }
-  }, [rawTurnDuration, message.id]);
+  }, [rawTurnDuration, message.id, threadId]);
 
   const handleDurationChange = useCallback(
     (d: number | undefined) => {
@@ -252,7 +307,7 @@ function MessageContent_({
         setCachedDuration(d);
       }
     },
-    [message.id],
+    [message.id, threadId],
   );
 
   useEffect(() => {
@@ -272,24 +327,16 @@ function MessageContent_({
   const components = useMemo(
     () => ({
       img: (props: ImgHTMLAttributes<HTMLImageElement>) => (
-        <MessageImage {...props} threadId={threadId} maxWidth="90%" />
+        <MessageImage
+          {...props}
+          threadId={threadId}
+          artifactPaths={artifactPaths}
+          maxWidth="90%"
+        />
       ),
-      a: ({ href, ...props }: AnchorHTMLAttributes<HTMLAnchorElement>) => {
-        if (href?.startsWith("/mnt/")) {
-          const url = resolveArtifactURL(href, threadId);
-          return (
-            <a
-              {...props}
-              href={url}
-              target="_blank"
-              rel="noopener noreferrer"
-            />
-          );
-        }
-        return <a {...props} href={href} />;
-      },
+      a: createMarkdownLinkComponent(threadId),
     }),
-    [threadId],
+    [artifactPaths, threadId],
   );
 
   const rawContent = extractContentFromMessage(message);
@@ -306,6 +353,16 @@ function MessageContent_({
     }
     return files as FileInMessage[];
   }, [message.additional_kwargs?.files, rawContent]);
+  const referenceAttachments = useMemo(
+    () =>
+      readReferenceMessageContexts(message.additional_kwargs).map(
+        (context, index) => ({
+          id: index,
+          context,
+        }),
+      ),
+    [message.additional_kwargs],
+  );
 
   const contentToDisplay = useMemo(() => {
     if (isHuman) {
@@ -313,6 +370,10 @@ function MessageContent_({
     }
     return rawContent ?? "";
   }, [rawContent, isHuman]);
+  const citationSources = useMemo(
+    () => (isHuman ? [] : extractCitationSources(contentToDisplay)),
+    [contentToDisplay, isHuman],
+  );
 
   const filesList =
     files && files.length > 0 ? (
@@ -364,12 +425,17 @@ function MessageContent_({
           className,
         )}
       >
+        {referenceAttachments.length > 0 && (
+          <ReferenceAttachmentSummary
+            className="self-end shadow-none"
+            references={referenceAttachments}
+            testId="message-reference-attachment"
+          />
+        )}
         {filesList}
         {contentToDisplay && (
           <AIElementMessageContent className="w-full max-w-full">
-            <div className="break-words whitespace-pre-wrap">
-              {contentToDisplay}
-            </div>
+            <HumanMessageText content={contentToDisplay} />
           </AIElementMessageContent>
         )}
       </div>
@@ -400,6 +466,14 @@ function MessageContent_({
         className="my-3"
         components={components}
       />
+      <CitationSourcesPanel sources={citationSources} />
+      {message.type === "ai" && (
+        <WorkspaceChangeBadge
+          threadId={threadId}
+          runId={runId}
+          disabled={isLoading}
+        />
+      )}
     </AIElementMessageContent>
   );
 }

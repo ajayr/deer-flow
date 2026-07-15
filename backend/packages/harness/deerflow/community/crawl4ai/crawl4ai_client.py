@@ -1,4 +1,6 @@
+import json
 import logging
+from typing import Any
 
 import httpx
 
@@ -23,7 +25,7 @@ class Crawl4AiClient:
         Returns:
             Markdown content, or an "Error: ..." string on failure.
         """
-        payload: dict[str, object] = {"url": url, "f": filter_mode}
+        payload: dict[str, Any] = {"url": url, "f": filter_mode}
         headers = {"Content-Type": "application/json"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -33,18 +35,23 @@ class Crawl4AiClient:
             async with httpx.AsyncClient(timeout=self.timeout_s) as client:
                 resp = await client.post(f"{self.base_url}/md", json=payload, headers=headers)
 
-            if resp.status_code != 200:
-                return f"Error: Crawl4AI HTTP {resp.status_code}: {resp.text[:200]}"
+                if resp.status_code != 200:
+                    return f"Error: Crawl4AI HTTP {resp.status_code}: {resp.text[:200]}"
 
-            data = resp.json()
-            if not data.get("success", False):
-                return f"Error: Crawl4AI reported failure for {url}"
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    content_type = resp.headers.get("content-type", "unknown")
+                    return f"Error: Crawl4AI returned a non-JSON 200 response (content-type: {content_type}): {resp.text[:200]}"
 
-            markdown = data.get("markdown") or ""
-            if not markdown.strip():
-                return "Error: Crawl4AI returned empty markdown"
+                if not data.get("success", False):
+                    return f"Error: Crawl4AI reported failure for {url}"
 
-            return markdown
+                markdown = data.get("markdown") or ""
+                if not markdown.strip():
+                    return "Error: Crawl4AI returned empty markdown"
+
+                return markdown
 
         except httpx.TimeoutException:
             return f"Error: Crawl4AI request timed out after {self.timeout_s}s"

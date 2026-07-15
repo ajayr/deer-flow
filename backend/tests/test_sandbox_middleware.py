@@ -37,7 +37,13 @@ class _SyncProvider(SandboxProvider):
 
 
 class _SandboxStub(Sandbox):
-    def execute_command(self, command: str) -> str:
+    def execute_command(
+        self,
+        command: str,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        del env, timeout
         return "OK"
 
     def read_file(self, path: str) -> str:
@@ -330,7 +336,7 @@ def test_wrap_tool_call_merges_with_existing_command_update() -> None:
         return Command(
             update={
                 "messages": [tool_msg],
-                "viewed_images": {"a.png": {"base64": "x", "mime_type": "image/png"}},
+                "viewed_images": {"a.png": {"mime_type": "image/png", "size": 1, "actual_path": "/tmp/a.png"}},
             },
             goto="next-node",
         )
@@ -341,7 +347,7 @@ def test_wrap_tool_call_merges_with_existing_command_update() -> None:
     assert result.goto == "next-node"
     assert isinstance(result.update, dict)
     assert result.update["messages"] == [tool_msg]
-    assert result.update["viewed_images"] == {"a.png": {"base64": "x", "mime_type": "image/png"}}
+    assert result.update["viewed_images"] == {"a.png": {"mime_type": "image/png", "size": 1, "actual_path": "/tmp/a.png"}}
     assert result.update["sandbox"] == {"sandbox_id": "new-sandbox"}
 
 

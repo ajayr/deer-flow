@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import yaml
 from dotenv import load_dotenv
@@ -13,20 +13,26 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from deerflow.config.acp_config import ACPAgentConfig, load_acp_config_from_dict
 from deerflow.config.agents_api_config import AgentsApiConfig, load_agents_api_config_from_dict
 from deerflow.config.auth_config import AuthAppConfig
+from deerflow.config.authorization_config import AuthorizationConfig, load_authorization_config_from_dict
 from deerflow.config.channel_connections_config import ChannelConnectionsConfig
 from deerflow.config.checkpointer_config import CheckpointerConfig, load_checkpointer_config_from_dict
 from deerflow.config.database_config import DatabaseConfig
 from deerflow.config.extensions_config import ExtensionsConfig
 from deerflow.config.guardrails_config import GuardrailsConfig, load_guardrails_config_from_dict
+from deerflow.config.input_polish_config import InputPolishConfig
 from deerflow.config.loop_detection_config import LoopDetectionConfig
 from deerflow.config.memory_config import MemoryConfig, load_memory_config_from_dict
 from deerflow.config.model_config import ModelConfig
+from deerflow.config.read_before_write_config import ReadBeforeWriteConfig
 from deerflow.config.reload_boundary import format_field_description
 from deerflow.config.run_events_config import RunEventsConfig
+from deerflow.config.run_ownership_config import RunOwnershipConfig
 from deerflow.config.runtime_paths import existing_project_file
 from deerflow.config.safety_finish_reason_config import SafetyFinishReasonConfig
 from deerflow.config.sandbox_config import SandboxConfig
+from deerflow.config.scheduler_config import SchedulerConfig
 from deerflow.config.skill_evolution_config import SkillEvolutionConfig
+from deerflow.config.skill_scan_config import SkillScanConfig
 from deerflow.config.skills_config import SkillsConfig
 from deerflow.config.stream_bridge_config import StreamBridgeConfig, load_stream_bridge_config_from_dict
 from deerflow.config.subagents_config import SubagentsAppConfig, load_subagents_config_from_dict
@@ -37,6 +43,7 @@ from deerflow.config.token_budget_config import TokenBudgetConfig
 from deerflow.config.token_usage_config import TokenUsageConfig
 from deerflow.config.tool_config import ToolConfig, ToolGroupConfig
 from deerflow.config.tool_output_config import ToolOutputConfig
+from deerflow.config.tool_progress_config import ToolProgressConfig
 from deerflow.config.tool_search_config import ToolSearchConfig, load_tool_search_config_from_dict
 
 load_dotenv()
@@ -55,6 +62,35 @@ class CircuitBreakerConfig(BaseModel):
 
     failure_threshold: int = Field(default=5, description="Number of consecutive failures before tripping the circuit")
     recovery_timeout_sec: int = Field(default=60, description="Time in seconds before attempting to recover the circuit")
+
+
+class LoggingEnhanceConfig(BaseModel):
+    """Request trace logging enhancement settings."""
+
+    enabled: bool = Field(default=False, description="Enable request-level trace ids in Gateway response headers and log records.")
+    format: Literal["text", "json"] = Field(default="text", description="Enhanced log output format.")
+
+
+class LoggingConfig(BaseModel):
+    """Logging configuration."""
+
+    enhance: LoggingEnhanceConfig = Field(default_factory=LoggingEnhanceConfig, description="Request trace correlation logging settings.")
+
+
+def is_trace_correlation_enabled(config: Any) -> bool:
+    """Return ``True`` when ``logging.enhance.enabled`` is set on *config*.
+
+    Single source of truth for the request-trace-correlation gate, shared by
+    the Gateway ``TraceMiddleware`` and the embedded ``DeerFlowClient`` so
+    the two entry points cannot drift on when ``deerflow_trace_id`` is
+    emitted (Langfuse metadata) and when a request-level trace id is bound
+    at all. Accepts any object exposing ``logging.enhance.enabled`` via
+    ``getattr`` chains (``AppConfig``, ``SimpleNamespace`` fixtures, etc.);
+    missing intermediate attributes silently degrade to ``False``.
+    """
+    logging_config = getattr(config, "logging", None)
+    enhance = getattr(logging_config, "enhance", None)
+    return bool(getattr(enhance, "enabled", False))
 
 
 def _legacy_config_candidates() -> tuple[Path, ...]:
@@ -98,8 +134,20 @@ class AppConfig(BaseModel):
             field_doc="Logging level for deerflow and app modules (debug/info/warning/error); third-party libraries are not affected.",
         ),
     )
+    logging: LoggingConfig = Field(
+        default_factory=LoggingConfig,
+        description=format_field_description(
+            "logging",
+            field_doc="Structured logging and request trace correlation settings.",
+        ),
+    )
     token_usage: TokenUsageConfig = Field(default_factory=TokenUsageConfig, description="Token usage tracking configuration")
     token_budget: TokenBudgetConfig = Field(default_factory=TokenBudgetConfig, description="Token Budget tracking and limits configuration.")
+    max_recursion_limit: int = Field(
+        default=1000,
+        ge=1,
+        description="Hard server-side ceiling for a client-supplied run recursion_limit. Client values above this are clamped; prevents runaway LangGraph super-steps (LLM cost / DoS).",
+    )
     models: list[ModelConfig] = Field(default_factory=list, description="Available models")
     sandbox: SandboxConfig = Field(
         description=format_field_description(
@@ -110,6 +158,7 @@ class AppConfig(BaseModel):
     tools: list[ToolConfig] = Field(default_factory=list, description="Available tools")
     tool_groups: list[ToolGroupConfig] = Field(default_factory=list, description="Available tool groups")
     skills: SkillsConfig = Field(default_factory=SkillsConfig, description="Skills configuration")
+    skill_scan: SkillScanConfig = Field(default_factory=SkillScanConfig, description="Native deterministic skill safety scanning configuration")
     skill_evolution: SkillEvolutionConfig = Field(default_factory=SkillEvolutionConfig, description="Agent-managed skill evolution configuration")
     extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig, description="Extensions configuration (MCP servers and skills state)")
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig, description="Tool output budget protection configuration")
@@ -121,6 +170,8 @@ class AppConfig(BaseModel):
     acp_agents: dict[str, ACPAgentConfig] = Field(default_factory=dict, description="ACP-compatible agent configuration")
     subagents: SubagentsAppConfig = Field(default_factory=SubagentsAppConfig, description="Subagent runtime configuration")
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig, description="Guardrail middleware configuration")
+    authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig, description="Fine-grained resource authorization configuration (RBAC and beyond)")
+    input_polish: InputPolishConfig = Field(default_factory=InputPolishConfig, description="Pre-send input polishing configuration.")
     suggestions: SuggestionsConfig = Field(default_factory=SuggestionsConfig, description="Follow-up suggestions configuration.")
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig, description="LLM circuit breaker configuration")
     channel_connections: ChannelConnectionsConfig = Field(
@@ -131,6 +182,8 @@ class AppConfig(BaseModel):
         ),
     )
     loop_detection: LoopDetectionConfig = Field(default_factory=LoopDetectionConfig, description="Loop detection middleware configuration")
+    tool_progress: ToolProgressConfig = Field(default_factory=ToolProgressConfig, description="Tool progress state machine middleware configuration")
+    read_before_write: ReadBeforeWriteConfig = Field(default_factory=ReadBeforeWriteConfig, description="Read-before-write file gate middleware configuration")
     safety_finish_reason: SafetyFinishReasonConfig = Field(default_factory=SafetyFinishReasonConfig, description="Provider safety-filter finish_reason interception middleware configuration")
     auth: AuthAppConfig = Field(default_factory=AuthAppConfig, description="Authentication configuration (local + OIDC SSO)")
     model_config = ConfigDict(extra="allow")
@@ -148,6 +201,13 @@ class AppConfig(BaseModel):
             field_doc="Run-event store backend (memory for dev, db for production queries, jsonl for lightweight single-node persistence).",
         ),
     )
+    scheduler: SchedulerConfig = Field(
+        default_factory=SchedulerConfig,
+        description=format_field_description(
+            "scheduler",
+            field_doc="Scheduled task runtime configuration (background poller for one-time and cron agent runs).",
+        ),
+    )
     checkpointer: CheckpointerConfig | None = Field(
         default=None,
         description=format_field_description(
@@ -160,6 +220,13 @@ class AppConfig(BaseModel):
         description=format_field_description(
             "stream_bridge",
             field_doc="Stream bridge connecting agent workers to SSE endpoints.",
+        ),
+    )
+    run_ownership: RunOwnershipConfig = Field(
+        default_factory=RunOwnershipConfig,
+        description=format_field_description(
+            "run_ownership",
+            field_doc="Run ownership and lease configuration for multi-worker deployments.",
         ),
     )
 
@@ -288,6 +355,7 @@ class AppConfig(BaseModel):
         load_subagents_config_from_dict(config.subagents.model_dump())
         load_tool_search_config_from_dict(config.tool_search.model_dump())
         load_guardrails_config_from_dict(config.guardrails.model_dump())
+        load_authorization_config_from_dict(config.authorization.model_dump())
         load_checkpointer_config_from_dict(config.checkpointer.model_dump() if config.checkpointer is not None else None)
         load_stream_bridge_config_from_dict(config.stream_bridge.model_dump() if config.stream_bridge is not None else None)
         load_acp_config_from_dict({name: agent.model_dump() for name, agent in acp_agents.items()})

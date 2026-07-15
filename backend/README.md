@@ -73,6 +73,7 @@ Per-thread isolated execution with virtual path translation:
 - **Virtual paths**: `/mnt/user-data/{workspace,uploads,outputs}` → thread-specific physical directories
 - **Skills path**: `/mnt/skills` → `deer-flow/skills/` directory
 - **Skills loading**: Recursively discovers nested `SKILL.md` files under `skills/{public,custom}` and preserves nested container paths
+- **SkillScan**: Native offline deterministic scanning runs before the LLM skill scanner on installs and agent-managed skill writes; `CRITICAL` findings block and warning findings become LLM context
 - **File-write safety**: `str_replace` serializes read-modify-write per `(sandbox.id, path)` so isolated sandboxes keep concurrency even when virtual paths match
 - **Tools**: `bash`, `ls`, `read_file`, `write_file`, `str_replace` (`write_file` overwrites by default and exposes `append` for end-of-file writes; `bash` is disabled by default when using `LocalSandboxProvider`; use `AioSandboxProvider` for isolated shell access)
 
@@ -101,7 +102,7 @@ LLM-powered persistent context retention across conversations:
 |----------|-------|
 | **Sandbox** | `bash`, `ls`, `read_file`, `write_file`, `str_replace` |
 | **Built-in** | `present_files`, `ask_clarification`, `view_image`, `task` (subagent) |
-| **Community** | Tavily (web search), Jina AI (web fetch), Firecrawl (scraping), fastCRW (scraping), DuckDuckGo (image search) |
+| **Community** | Tavily (web search), Jina AI (web fetch), Crawl4AI (web fetch), Firecrawl (scraping), fastCRW (scraping), DuckDuckGo (image search) |
 | **MCP** | Any Model Context Protocol server (stdio, SSE, HTTP transports) |
 | **Skills** | Domain-specific workflows injected via system prompt |
 
@@ -127,9 +128,9 @@ FastAPI application providing REST endpoints for frontend integration:
 
 ### IM Channels
 
-The IM bridge supports Feishu, Slack, and Telegram. Slack and Telegram still use the final `runs.wait()` response path, while Feishu now streams through `runs.stream(["messages-tuple", "values"])` and updates a single in-thread card in place.
+The IM bridge supports Feishu, Slack, and Telegram. Slack and Telegram still use the final `runs.wait()` response path, while Feishu now streams through `runs.stream(["messages-tuple", "values"])`, serializes rapid same-thread turns inside the channel manager, and updates a single in-thread card per source message in place.
 
-For Feishu card updates, DeerFlow stores the running card's `message_id` per inbound message and patches that same card until the run finishes, preserving the existing `OK` / `DONE` reaction flow.
+For Feishu card updates, DeerFlow stores the running card's `message_id` per inbound message and patches that same card until the run finishes, preserving the existing `OK` / `DONE` reaction flow. When a follow-up arrives inside an existing Feishu topic while another turn is still running, the later message now waits on the mapped DeerFlow `thread_id`, receives a queued/running card on that exact source message, and keeps a compact source-message blockquote in subsequent patches so rapid consecutive questions remain distinguishable.
 
 ---
 
@@ -221,32 +222,41 @@ Sessions opened in the TUI appear in the Web UI sidebar (it writes the shared
 
 ```
 backend/
-├── src/
-│   ├── agents/                  # Agent system
-│   │   ├── lead_agent/         # Main agent (factory, prompts)
-│   │   ├── middlewares/        # 9 middleware components
-│   │   ├── memory/             # Memory extraction & storage
-│   │   └── thread_state.py    # ThreadState schema
-│   ├── gateway/                # FastAPI Gateway API
-│   │   ├── app.py             # Application setup
-│   │   └── routers/           # 6 route modules
-│   ├── sandbox/                # Sandbox execution
-│   │   ├── local/             # Local filesystem provider
-│   │   ├── sandbox.py         # Abstract interface
-│   │   ├── tools.py           # bash, ls, read/write/str_replace
-│   │   └── middleware.py      # Sandbox lifecycle
-│   ├── subagents/              # Subagent delegation
-│   │   ├── builtins/          # general-purpose, bash agents
-│   │   ├── executor.py        # Background execution engine
-│   │   └── registry.py        # Agent registry
-│   ├── tools/builtins/         # Built-in tools
-│   ├── mcp/                    # MCP protocol integration
-│   ├── models/                 # Model factory
-│   ├── skills/                 # Skill discovery & loading
-│   ├── config/                 # Configuration system
-│   ├── community/              # Community tools & providers
-│   ├── reflection/             # Dynamic module loading
-│   └── utils/                  # Utilities
+├── packages/harness/           # deerflow-harness package (import: deerflow.*)
+│   └── deerflow/
+│       ├── agents/             # Agent system
+│       │   ├── lead_agent/     # Main agent (factory, prompts)
+│       │   ├── middlewares/    # Middleware components
+│       │   ├── memory/         # Memory extraction & storage
+│       │   └── thread_state.py # ThreadState schema
+│       ├── sandbox/            # Sandbox execution
+│       │   ├── local/          # Local filesystem provider
+│       │   ├── sandbox.py      # Abstract interface
+│       │   ├── tools.py        # bash, ls, read/write/str_replace
+│       │   └── middleware.py   # Sandbox lifecycle
+│       ├── subagents/          # Subagent delegation
+│       │   ├── builtins/       # general-purpose, bash agents
+│       │   ├── executor.py     # Background execution engine
+│       │   └── registry.py     # Agent registry
+│       ├── tools/builtins/     # Built-in tools
+│       ├── mcp/                # MCP protocol integration
+│       ├── models/             # Model factory
+│       ├── skills/             # Skill discovery & loading
+│       ├── config/             # Configuration system
+│       ├── runtime/            # Embedded run execution (RunManager, StreamBridge)
+│       ├── persistence/        # Checkpointer/store engines & schema migrations
+│       ├── guardrails/         # Pre-tool-call authorization providers
+│       ├── tracing/            # Tracer factory & trace metadata
+│       ├── uploads/            # Uploads manager
+│       ├── tui/                # Terminal UI (`deerflow` console script)
+│       ├── community/          # Community tools & providers
+│       ├── reflection/         # Dynamic module loading
+│       └── utils/              # Utilities
+├── app/                        # FastAPI Gateway + IM channels (import: app.*)
+│   ├── gateway/                # Gateway API
+│   │   ├── app.py              # Application setup
+│   │   └── routers/            # Route modules
+│   └── channels/               # IM channel integrations
 ├── docs/                       # Documentation
 ├── tests/                      # Test suite
 ├── langgraph.json              # LangGraph graph registry for tooling/Studio compatibility
@@ -307,6 +317,26 @@ MCP servers and skill states in a single file:
         "client_id": "$MCP_OAUTH_CLIENT_ID",
         "client_secret": "$MCP_OAUTH_CLIENT_SECRET"
       }
+    },
+    "postgres": {
+      "enabled": false,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"],
+      "description": "PostgreSQL database access",
+      "routing": {
+        "mode": "prefer",
+        "priority": 50,
+        "keywords": ["orders", "users", "SQL", "database", "table"]
+      },
+      "tools": {
+        "query": {
+          "routing": {
+            "priority": 100,
+            "keywords": ["query database", "orders table", "metrics"]
+          }
+        }
+      }
     }
   },
   "skills": {
@@ -314,6 +344,12 @@ MCP servers and skill states in a single file:
   }
 }
 ```
+
+`routing` adds soft MCP preference hints to the agent prompt. It helps the
+model prefer a configured MCP tool for matching requests without forbidding
+other tools. When `tool_search.enabled=true` defers MCP schemas, matching
+routing metadata can auto-promote up to `tool_search.auto_promote_top_k`
+deferred schemas before the model call.
 
 ### Environment Variables
 
