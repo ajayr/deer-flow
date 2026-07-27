@@ -65,6 +65,20 @@ Mitigations, in order of effectiveness:
    ("Blocked by anti-bot protection" = the site still refused; a 401 instead
    would mean the *bearer token* is wrong, an unrelated problem).
 
+## Status
+
+A logged-in **Reddit** session is installed (2026-07-27) and verified through all
+three consumers: crawl4ai directly, hermes' `reddit_public.py` (25/25 posts), and
+DeerFlow `web_fetch`. `GET /api/me.json` returns an authenticated identity, and
+listing responses carry a non-empty `modhash` — both are logged-in-only signals.
+
+Known limit on the DeerFlow side: `web_fetch_tool` ends with `return markdown[:4096]`,
+a hardcoded DeerFlow-wide cap (upstream convention, same as the Jina provider). So the
+agent sees roughly the first screenful of a thread, not a full comment tree. Hermes is
+unaffected because it talks to crawl4ai directly. Raising it means patching the
+upstream-tracked `community/crawl4ai/tools.py` and would enlarge every fetch's context
+cost, so it is deliberately left alone for now.
+
 ## Gotchas that cost time
 
 - **`--grant-uid 999` on every rotation.** The container runs as uid 999
