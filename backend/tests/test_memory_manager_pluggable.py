@@ -15,6 +15,7 @@ are independent of order.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -78,18 +79,23 @@ def test_noop_runs_with_empty_memory() -> None:
     assert manager.get_memory(user_id="u") == {"facts": []}
 
 
-def test_internal_capabilities_are_hasattr_probeable() -> None:
-    """reload_memory + fact CRUD + warm exist on DeerMem but not on noop (the ABC omits them)."""
-    set_memory_config(MemoryConfig(manager_class="deermem"))
-    deermem = get_memory_manager()
-    for cap in ("warm", "reload_memory", "create_fact", "delete_fact", "update_fact"):
-        assert hasattr(deermem, cap), cap
-
-    reset_memory_manager()
+def test_tier3_hooks_have_defaults_noop_inherits() -> None:
+    """warm/reload/fact CRUD are tier-3 hooks ON the ABC with defaults (no more
+    ``hasattr`` probing): noop inherits ``warm``=None (nothing to warm) and
+    fact-CRUD/reload raise ``NotImplementedError``. DeerMem overrides the ones
+    it supports (covered elsewhere)."""
     set_memory_config(MemoryConfig(manager_class="noop"))
     noop = get_memory_manager()
-    for cap in ("warm", "reload_memory", "create_fact", "delete_fact", "update_fact"):
-        assert not hasattr(noop, cap), cap
+    assert noop.warm() is None  # inherited default (nothing to warm)
+    with pytest.raises(NotImplementedError):
+        noop.reload_memory(user_id="u")
+    with pytest.raises(NotImplementedError):
+        noop.create_fact("x", user_id="u")
+    with pytest.raises(NotImplementedError):
+        noop.delete_fact("x", user_id="u")
+    with pytest.raises(NotImplementedError):
+        noop.update_fact("x", user_id="u")
+    reset_memory_manager()
 
 
 def test_deermem_search_works_delete_export_are_stubs() -> None:
@@ -142,7 +148,53 @@ def test_empty_storage_path_factory_injects_runtime_home(tmp_path, monkeypatch) 
     set_memory_config(MemoryConfig(manager_class="deermem"))  # no storage_path
     manager = get_memory_manager()
     assert Path(manager._config.storage_path) == tmp_path
-    manager.create_fact("hello", user_id="u1")
+    manager.create_fact("hello", user_id="u1", agent_name="test-agent")
     # per-user dir created under the injected runtime_home root
     user_dirs = [p.name for p in (tmp_path / "users").iterdir() if p.is_dir()]
     assert len(user_dirs) == 1
+
+
+def test_shutdown_flush_has_default_and_noop_is_noop_success() -> None:
+    """``shutdown_flush`` is a tier-2 method with a default (True -- backends
+    without a buffer have nothing to drain), NOT abstract; noop inherits/overrides
+    to True. Only ``add`` / ``get_context`` are tier-1 abstract."""
+    assert "add" in MemoryManager.__abstractmethods__
+    assert "get_context" in MemoryManager.__abstractmethods__
+    assert "shutdown_flush" not in MemoryManager.__abstractmethods__
+    reset_memory_manager()
+    set_memory_config(MemoryConfig(manager_class="noop"))
+    noop = get_memory_manager()
+    assert noop.shutdown_flush(1.0) is True
+    reset_memory_manager()
+
+
+def test_deermem_shutdown_flush_delegates_to_queue_flush_sync() -> None:
+    """DeerMem.shutdown_flush delegates to its queue's bounded flush_sync,
+    forwarding the host-owned timeout budget unchanged."""
+    reset_memory_manager()
+    set_memory_config(MemoryConfig(manager_class="deermem"))
+    deermem = get_memory_manager()
+    with patch.object(deermem._queue, "flush_sync", return_value=True) as spy:
+        assert deermem.shutdown_flush(7.0) is True
+        spy.assert_called_once_with(7.0)
+    reset_memory_manager()
+
+
+def test_deermem_shutdown_flush_drains_a_pending_update() -> None:
+    """End-to-end: a pending update sitting in DeerMem's queue is drained
+    within the timeout on shutdown_flush (the loss-on-exit bug the ABC method
+    fixes). The drain skips inter-item sleep so the budget goes to LLM calls."""
+    from deerflow.agents.memory.backends.deermem.deermem.core.queue import ConversationContext
+
+    reset_memory_manager()
+    set_memory_config(MemoryConfig(manager_class="deermem"))
+    deermem = get_memory_manager()
+    # Inject a mock updater so no real LLM call is made; both items "succeed".
+    mock_updater = MagicMock()
+    mock_updater.update_memory.return_value = True
+    deermem._queue._updater = mock_updater
+    deermem._queue._items = [ConversationContext(thread_id=f"t{i}", messages=["m"], agent_name="lead_agent") for i in range(3)]
+    assert deermem.shutdown_flush(5.0) is True
+    assert deermem._queue.pending_count == 0
+    assert mock_updater.update_memory.call_count == 3
+    reset_memory_manager()

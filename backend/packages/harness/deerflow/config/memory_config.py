@@ -4,7 +4,8 @@ DeerMem-private fields live in ``backends/deermem/config.py`` (``DeerMemConfig``
 reached via ``backend_config`` (a dict the factory passes to the backend's
 ``__init__``). This module holds ONLY the host-shared fields every backend /
 call site / factory reads: ``enabled`` / ``injection_enabled`` /
-``manager_class`` / ``backend_config``. Keeping the shared schema slim is what
+``shutdown_flush_timeout_seconds`` / ``manager_class`` / ``backend_config``.
+Keeping the shared schema slim is what
 makes backends swappable and portable (DeerMem's knobs do not leak onto the
 shared contract).
 """
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Host-shared MemoryConfig fields (read by every backend / call site / factory).
-_SHARED_FIELDS = frozenset({"enabled", "mode", "injection_enabled", "manager_class", "backend_config"})
+_SHARED_FIELDS = frozenset({"enabled", "mode", "injection_enabled", "shutdown_flush_timeout_seconds", "manager_class", "backend_config"})
 
 # DeerMem-private fields that used to live at the top level of `memory:` in
 # config.yaml (pre-abstraction). On load they are auto-migrated into
@@ -40,6 +41,8 @@ _LEGACY_DEERMEM_FIELDS = frozenset(
         "staleness_min_candidates",
         "staleness_max_removals_per_cycle",
         "staleness_protected_categories",
+        "staleness_max_lifetime_multiplier",
+        "staleness_max_extension_days",
         "consolidation_enabled",
         "consolidation_min_facts",
         "consolidation_max_groups_per_cycle",
@@ -65,6 +68,23 @@ class MemoryConfig(BaseModel):
     injection_enabled: bool = Field(
         default=True,
         description="Whether to inject memory into the system prompt (call-site gate).",
+    )
+    shutdown_flush_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description=(
+            "Hard time budget (seconds) for draining the memory backend's "
+            "pending-update buffer during Gateway graceful shutdown. The drain "
+            "makes one LLM call per pending item, so large IM batches may need "
+            "a higher value. Must fit inside the pod's K8s "
+            "terminationGracePeriodSeconds (together with channel/scheduler "
+            "stop) or K8s SIGKILLs the drain mid-flight. The drain runs on a "
+            "daemon thread, so on timeout the process proceeds to exit and any "
+            "unfinished tail is dropped (same failure direction as no flush, "
+            "scoped to the tail). Host-shared (not backend-private): the host "
+            "owns the lifespan budget and the K8s grace relationship."
+        ),
     )
     manager_class: str = Field(
         default="deermem",
@@ -101,7 +121,36 @@ _memory_config: MemoryConfig = MemoryConfig()
 
 
 def get_memory_config() -> MemoryConfig:
-    """Get the current memory configuration."""
+    """Get the current memory configuration.
+
+    ``_memory_config`` is only refreshed as a side effect of ``get_app_config()``
+    reloading (via ``_apply_singleton_configs`` -> ``load_memory_config_from_dict``).
+    A reader that reaches memory config without going through ``get_app_config()``
+    first -- e.g. the agent factory deciding whether to bind the memory tools --
+    would otherwise see a stale ``memory.mode`` after a ``config.yaml`` edit, even
+    though ``memory.*`` is documented as hot-reloadable. Trigger the same
+    signature-checked reload here so the singleton follows the config file.
+
+    If ``get_app_config()`` has never been called (``_app_config`` is ``None``),
+    there is no stale config to refresh, so we keep the pre-existing behaviour
+    of returning the in-memory singleton.  This avoids picking up a config file
+    as a side effect of the first access to ``get_memory_config()``, which would
+    break callers that expect module-level defaults (e.g. unit tests).
+    """
+    # Lazy import: app_config imports this module, so a top-level import cycles.
+    from .app_config import _app_config, get_app_config
+
+    if _app_config is not None:
+        try:
+            get_app_config()
+        except Exception:
+            # If the config file is transiently broken (invalid YAML, schema
+            # violation, missing env var, etc.), keep the last-good singleton
+            # so an in-flight turn completes normally instead of crashing.
+            logger.warning(
+                "Failed to reload app config from get_memory_config(); falling back to cached memory config.",
+                exc_info=True,
+            )
     return _memory_config
 
 
