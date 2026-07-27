@@ -1,5 +1,19 @@
 # Crawl4AI `web_fetch` Provider Implementation Plan
 
+> **Historical record — two things below are NOT what shipped (corrected 2026-07-27):**
+>
+> 1. **The config key is `timeout`, not `timeout_s`.** This doc says `timeout_s` throughout
+>    because the design mirrored `BrowserlessClient`, and browserless really does read
+>    `cfg.get("timeout_s")` — but it is the odd one out. The shipped
+>    `community/crawl4ai/tools.py` reads `cfg.get("timeout")`, matching `jina_ai` and
+>    `config.example.yaml`. A `timeout_s:` key in `config.yaml` is **silently ignored** and
+>    the 30s default applies (this bit us: our own `config.yaml` carried `timeout_s` until
+>    2026-07-27). The Python *constructor* parameter really is `timeout_s` — that part of
+>    this doc is correct; only the YAML key differs.
+> 2. **The image pin `0.8.6` is obsolete and unsafe.** Use >= 0.8.7 (two pre-auth RCEs,
+>    CVSS 9.8) and note that >= 0.9 makes bearer auth mandatory. This deployment runs
+>    0.9.2 with a token; see `docker/crawl4ai/README.md` and the root `CLAUDE.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the failing Jina `web_fetch` with a self-hosted Crawl4AI container, via a new `deerflow.community.crawl4ai` provider that calls Crawl4AI's `POST /md`.

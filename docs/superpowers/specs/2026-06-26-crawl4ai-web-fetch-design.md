@@ -1,5 +1,13 @@
 # Self-hosted Crawl4AI as the `web_fetch` provider
 
+> **Historical record — corrected 2026-07-27.** The pseudo-code below reads the config
+> key `timeout_s` (mirroring `BrowserlessClient`, the one provider that really does use
+> that spelling). What shipped reads **`timeout`**, like `jina_ai` and
+> `config.example.yaml`; a `timeout_s:` key in `config.yaml` is silently ignored. The
+> `Crawl4AiClient(..., timeout_s=...)` *constructor parameter* is unchanged and correct.
+> Also: the `0.8.6` image pin here is obsolete — use >= 0.8.7 (pre-auth RCEs) and expect
+> mandatory bearer auth from >= 0.9. See `docker/crawl4ai/README.md`.
+
 ## Overview
 
 Replace the failing Jina `web_fetch` provider with a self-hosted **Crawl4AI**
