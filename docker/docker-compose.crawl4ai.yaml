@@ -2,9 +2,12 @@
 #
 # Own lifecycle (own compose file, NOT referenced by scripts/deploy.sh), but it
 # ATTACHES to DeerFlow's existing internal docker network so the gateway reaches
-# it by service name with NO published host port. Crawl4AI runs unauthenticated
-# (JWT off) and will fetch ANY URL, so it must never be exposed on a host
-# interface — keeping it network-internal is the security boundary. (Also keeps
+# it by service name with NO published host port. Since 0.9.x the server is
+# secure-by-default: CRAWL4AI_API_TOKEN is REQUIRED (bearer auth on every
+# request except GET /health) — without it the server binds loopback-only and
+# the gateway could not reach it at all. Keeping it network-internal remains
+# the outer security boundary; the token is defense in depth (it also gates
+# host-side consumers — see the hermes skills). (Own compose file also keeps
 # merge surface at zero: no edits to the upstream-tracked docker-compose.yaml /
 # deploy.sh / nginx.conf.)
 #
@@ -13,24 +16,34 @@
 #   If you renamed the project, update the `name:` under `networks:` below to
 #   match `docker network ls | grep deer-flow`.
 #
-# Start:   docker compose -f docker/docker-compose.crawl4ai.yaml up -d
-# Stop:    docker compose -f docker/docker-compose.crawl4ai.yaml down
+# Start (FROM THE REPO ROOT — --env-file is required so ${CRAWL4AI_API_TOKEN}
+# interpolates from the root .env; compose would otherwise look for docker/.env):
+#   docker compose --env-file .env -f docker/docker-compose.crawl4ai.yaml up -d
+# Stop:    docker compose --env-file .env -f docker/docker-compose.crawl4ai.yaml down
 # Health:  docker exec crawl4ai curl -fsS http://localhost:11235/health
-#          (no host port is published — not reachable from the host directly)
+#          (auth-exempt endpoint; no host port is published)
 #
 # The gateway reaches this server at http://crawl4ai:11235 over the shared
-# network (config.yaml -> tools -> web_fetch -> base_url), mirroring how
-# DeerFlow's own browserless example addresses a Docker service by name.
+# network (config.yaml -> tools -> web_fetch -> base_url + token). The static
+# ipv4_address exists for HOST-side consumers (the hermes skills reach the
+# container by bridge IP, which docker otherwise reassigns on recreate); it is
+# deliberately high in the /16 so dynamic allocation never collides with it.
 services:
   crawl4ai:
-    image: unclecode/crawl4ai:0.8.6
+    image: unclecode/crawl4ai:0.9.2
     container_name: crawl4ai
     # No `ports:` — deliberately NOT published to the host. Reachable only from
-    # containers on the deer-flow network (i.e. the gateway), never externally.
+    # containers on the deer-flow network (i.e. the gateway) and from host
+    # processes via the static bridge IP below, never from the LAN/outside.
     shm_size: "1g"
     restart: unless-stopped
+    environment:
+      # :? makes compose fail loudly if the var is missing instead of silently
+      # starting a loopback-only server that the gateway cannot reach.
+      - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set in root .env; start with --env-file .env}
     networks:
-      - deer-flow
+      deer-flow:
+        ipv4_address: 172.24.100.5
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:11235/health"]
       interval: 30s
