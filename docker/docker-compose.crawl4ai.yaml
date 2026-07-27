@@ -41,6 +41,24 @@ services:
       # :? makes compose fail loudly if the var is missing instead of silently
       # starting a loopback-only server that the gateway cannot reach.
       - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:?set in root .env; start with --env-file .env}
+    volumes:
+      # Logged-in browser session (Playwright storage_state) + the server config
+      # that points at it. Both live OUTSIDE the repo in ~/.crawl4ai (mode 700)
+      # because the state file holds live session cookies and the repo root is
+      # bind-mounted into the gateway.
+      #
+      # The DIRECTORY is mounted (not the state file directly) so rotating the
+      # cookies with an atomic write does not leave the container pinned to the
+      # old inode -- same reasoning as the gateway's config dir-mount.
+      # config.yml is a single-file mount by necessity (the server reads it from
+      # a fixed path); it changes rarely and a recreate applies it.
+      #
+      # NB the target is /app/config.yml: the server process runs from /app and
+      # loads THAT copy. The image also carries a full source tree at
+      # /tmp/project/deploy/docker/ containing an identical-looking config.yml
+      # which is never read -- mounting over that one silently does nothing.
+      - ${HOME}/.crawl4ai:/etc/crawl4ai-local:ro
+      - ${HOME}/.crawl4ai/config.yml:/app/config.yml:ro
     networks:
       deer-flow:
         ipv4_address: 172.24.100.5
