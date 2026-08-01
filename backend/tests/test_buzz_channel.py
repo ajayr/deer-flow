@@ -9,7 +9,7 @@ pytest.importorskip("coincurve")
 from app.channels.base import Channel
 from app.channels.buzz import BuzzChannel
 from app.channels.manager import CHANNEL_CAPABILITIES
-from app.channels.message_bus import MessageBus
+from app.channels.message_bus import InboundMessageType, MessageBus
 from app.channels.run_policy import CHANNEL_RUN_POLICY
 from app.channels.service import _CHANNEL_CREDENTIAL_KEYS, _CHANNEL_REGISTRY
 
@@ -119,3 +119,93 @@ def test_stop_is_safe_after_the_relay_task_already_crashed():
         assert ch._task is None
 
     asyncio.run(run())
+
+
+def _event(*, pubkey=OWNER, kind=9, content="@DeerFlow hello", channel=CHANNEL, mentions=(PK3_HEX,), reply_to=None, eid="11" * 32, created_at=1700000100):
+    tags = [["h", channel]]
+    if reply_to:
+        tags.append(["e", reply_to])
+    tags.extend(["p", m] for m in mentions)
+    return {"id": eid, "pubkey": pubkey, "created_at": created_at, "kind": kind, "tags": tags, "content": content}
+
+
+def _started(**overrides):
+    ch = _channel(**overrides)
+    ch._keys = __import__("app.channels.buzz_nostr", fromlist=["x"]).parse_private_key(SK3_HEX)
+    captured = []
+
+    async def publish(msg):
+        captured.append(msg)
+
+    ch._publish = publish
+    return ch, captured
+
+
+def _dispatch(ch, ev):
+    import json
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "sub1", ev])))
+
+
+def test_mentioned_allowed_author_is_published():
+    ch, captured = _started()
+    _dispatch(ch, _event())
+    assert len(captured) == 1
+    msg = captured[0]
+    assert msg.channel_name == "buzz" and msg.chat_id == CHANNEL and msg.user_id == OWNER
+    assert msg.text == "hello"  # own leading @mention stripped
+    assert msg.metadata["event_id"] == "11" * 32 and msg.workspace_id == "buzz.example.com"
+    assert msg.msg_type == InboundMessageType.CHAT
+
+
+def test_disallowed_author_is_dropped():
+    ch, captured = _started()
+    _dispatch(ch, _event(pubkey="ee" * 32))
+    assert captured == []
+
+
+def test_own_events_are_ignored():
+    ch, captured = _started()
+    _dispatch(ch, _event(pubkey=PK3_HEX))
+    assert captured == []
+
+
+def test_unmentioned_channel_message_is_dropped_but_dm_passes():
+    ch, captured = _started()
+    _dispatch(ch, _event(content="no mention here", mentions=()))
+    assert captured == []
+    ch._handle_meta_event({"kind": 39000, "tags": [["d", CHANNEL], ["t", "dm"], ["name", "DM"]]})
+    _dispatch(ch, _event(content="dm without mention", mentions=(), eid="22" * 32))
+    assert len(captured) == 1 and captured[0].text == "dm without mention"
+
+
+def test_mention_free_channel_and_thread_follow_pass_without_mention():
+    ch, captured = _started(mention_free_channels=[CHANNEL])
+    _dispatch(ch, _event(content="open channel", mentions=()))
+    assert len(captured) == 1
+
+    class FakeStore:
+        def get_thread_id(self, channel_name, chat_id, topic_id=None):
+            return "thread-1" if topic_id == "aa" * 32 else None
+
+    ch2, captured2 = _started()
+    ch2.config["channel_store"] = FakeStore()
+    _dispatch(ch2, _event(content="follow-up", mentions=(), reply_to="aa" * 32, eid="33" * 32))
+    assert len(captured2) == 1 and captured2[0].topic_id == "aa" * 32
+
+
+def test_thread_replies_map_topic_and_requester_and_watermark():
+    ch, captured = _started()
+    _dispatch(ch, _event(reply_to="aa" * 32, created_at=1700000200))
+    assert captured[0].topic_id == "aa" * 32 and captured[0].thread_ts == "aa" * 32
+    assert ch._last_requester[(CHANNEL, "aa" * 32)] == OWNER
+    assert ch._seen_created_at == 1700000200
+
+
+def test_auth_frame_records_challenge_and_meta_defaults_fail_closed():
+    ch, captured = _started()
+    asyncio.run(ch.handle_relay_frame('["AUTH","challenge-xyz"]'))
+    assert ch._pending_auth_challenge == "challenge-xyz"
+    # unknown channel type == not a DM -> unmentioned message still dropped
+    _dispatch(ch, _event(channel="99999999-9999-4999-8999-999999999999", content="x", mentions=()))
+    assert captured == []
