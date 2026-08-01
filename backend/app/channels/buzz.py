@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -59,6 +60,8 @@ def _chunk_text(text: str, limit: int = EDIT_MAX_BYTES) -> list[str]:
 
 
 class BuzzChannel(Channel):
+    _connect: Any = None  # test seam: async callable returning an async-context-manager transport
+
     def __init__(self, bus: MessageBus, config: dict[str, Any]) -> None:
         super().__init__(name="buzz", bus=bus, config=config)
         self._relay_url = str(config.get("relay_url", "")).strip()
@@ -109,16 +112,123 @@ class BuzzChannel(Channel):
             except (asyncio.CancelledError, TimeoutError):
                 pass
             except Exception:
-                # Task 6 replaces the stub _run_loop; until then (and even after, for a
-                # genuine crash) stop() must still complete cleanly rather than re-raise
-                # whatever the relay loop task ended with.
+                # _run_loop is designed to never end on an ordinary connection error (it
+                # backs off and retries instead -- see its docstring), but stop() must
+                # still complete cleanly rather than re-raise whatever a genuine bug in
+                # the relay loop task ended with.
                 logger.exception("[buzz] relay loop task ended with an error during stop")
             finally:
                 self._task = None
         logger.info("[buzz] channel stopped")
 
-    async def _run_loop(self) -> None:  # implemented in Task 6
-        raise NotImplementedError
+    def _subscription_filters(self) -> list[dict]:
+        """NIP-01 REQ filters for our one subscription: member chat plus channel metadata.
+
+        ``since`` rides on the chat filter only when we have a watermark
+        (``_seen_created_at``, advanced by ``_handle_chat_event``): on a fresh
+        channel this is 0 (no watermark yet, so no ``since`` -- the relay's default
+        backlog applies), and on every reconnect afterwards it is the newest
+        ``created_at`` we have already processed, so re-subscribing after a drop
+        does not replay the entire channel history nor silently skip events
+        published while we were disconnected.
+        """
+        chat_filter: dict = {"kinds": [buzz_nostr.KIND_CHAT]}
+        if self._seen_created_at:
+            chat_filter["since"] = self._seen_created_at
+        return [chat_filter, {"kinds": [buzz_nostr.KIND_CHANNEL_META]}]
+
+    async def _session(self, ws) -> None:
+        """Run one relay connection's lifetime: subscribe, authenticate if challenged, read frames.
+
+        ``self._transport`` is set for the duration of this connection so ``send()``
+        / ``_post_event()`` can post outbound events on it, and is unconditionally
+        cleared in ``finally`` on the way out -- including on error -- so a stale
+        reference can never survive past this connection (``_post_event`` reads it
+        fresh on every call and raises when it is ``None``; see its docstring).
+
+        NIP-42 auth is opportunistic, not upfront: the initial REQ is sent
+        immediately in case the relay allows unauthenticated reads, but
+        ``handle_relay_frame`` records any ``AUTH`` challenge the relay sends onto
+        ``self._pending_auth_challenge``, and this loop reacts to it the next time
+        around by signing and sending the AUTH event and then RESUBSCRIBING --
+        our relay is closed, so the pre-auth REQ may have been silently rejected,
+        and without resubscribing we would end up authenticated but listening to
+        nothing. A fresh challenge is per-connection (the relay mints a new one on
+        every new socket), so this runs again from scratch on every reconnect.
+        """
+        self._transport = ws
+        try:
+            await ws.send(buzz_nostr.req_frame("buzz-main", *self._subscription_filters()))
+            async for raw in ws:
+                await self.handle_relay_frame(raw)
+                if self._pending_auth_challenge is not None:
+                    assert self._keys is not None
+                    challenge = self._pending_auth_challenge
+                    self._pending_auth_challenge = None
+                    auth = buzz_nostr.build_auth_event(self._keys, self._relay_url, challenge, created_at=int(time.time()))
+                    await ws.send(json.dumps(["AUTH", auth], separators=(",", ":")))
+                    # Re-subscribe post-auth: the pre-auth REQ may have been rejected on closed relays.
+                    await ws.send(buzz_nostr.req_frame("buzz-main", *self._subscription_filters()))
+        finally:
+            self._transport = None
+
+    async def _run_loop(self) -> None:
+        """Own the relay connection for the channel's lifetime: connect, run one session, retry forever.
+
+        Runs as the asyncio task ``_spawn_connection`` starts; ``stop()`` cancels it.
+        Every sibling connector (wecom.py, discord.py, feishu.py) delegates
+        reconnection to its vendor SDK -- Buzz has no SDK, so this loop owns
+        reconnect/backoff itself: exponential backoff capped at 60s with jitter
+        (so a thundering herd of Buzz-connected agents restarting together does not
+        all retry in lockstep), reset to 0 after any connection that actually got
+        established (so a long stable run doesn't leave a stale attempt count that
+        punishes the next transient blip with a large initial delay).
+
+        A clean stream end -- ``_session`` returning normally because the relay
+        closed the socket on us -- is treated the same as a connection error: both
+        fall through to the backoff-and-retry below rather than ending the loop,
+        because for a relay client "the peer hung up" is exactly the situation
+        reconnection exists for.
+
+        ``asyncio.CancelledError`` is re-raised immediately rather than reaching the
+        generic ``except Exception`` below -- it isn't an ``Exception`` subclass in
+        the supported Python version anyway, but the explicit clause documents the
+        contract: this is how the guarded ``stop()`` (Task 3) actually stops this
+        otherwise-infinite loop, and it must never be swallowed here.
+
+        Untrusted relay input is guarded one layer down: ``handle_relay_frame``
+        already logs-and-drops a non-JSON payload or a malformed ``EVENT`` instead
+        of raising, so a single bad frame reaches neither this loop's
+        ``except Exception`` (reconnect) nor kills the read loop -- it is simply
+        skipped and iteration continues.
+        """
+        attempt = 0
+        while True:
+            try:
+                if self._connect is not None:
+                    ws = await self._connect()
+                else:
+                    import websockets
+
+                    ws = await websockets.connect(self._relay_url)
+                async with ws:
+                    attempt = 0  # reset only once a connection is actually established
+                    await self._session(ws)
+                # Clean stream end (relay closed on us): reconnect with backoff too.
+                attempt += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                logger.warning("[buzz] relay connection error (attempt %d): %s", attempt, exc)
+            # Cap the counter itself, not just the delay: 2**10 already exceeds the
+            # 60s ceiling below, so clamping here keeps the exponent computation
+            # cheap indefinitely instead of growing the attempt count (and the
+            # bigint math behind 2**attempt) without bound across a very long
+            # outage.
+            attempt = min(attempt, 10)
+            delay = min(60, 2**attempt) + random.uniform(0, 1)
+            await asyncio.sleep(delay)
 
     # -- inbound -------------------------------------------------------------
 

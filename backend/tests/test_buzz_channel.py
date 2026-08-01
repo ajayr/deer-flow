@@ -96,27 +96,45 @@ def test_start_is_idempotent_against_double_start():
 def test_stop_is_safe_after_the_relay_task_already_crashed():
     """stop() must not re-raise a stored exception from an already-finished task.
 
-    Reproduces the review finding that, after a real (non-monkeypatched)
-    start(), the stubbed _run_loop() raises NotImplementedError almost
-    immediately; a later stop() awaited the finished task and only caught
-    CancelledError/TimeoutError, so the NotImplementedError propagated out
-    of stop() — leaving `_task` non-None and skipping the "stopped" log.
+    Reproduces the review finding that a later stop() awaited the finished relay
+    task and only caught CancelledError/TimeoutError, so any other stored
+    exception propagated out of stop() -- leaving `_task` non-None and skipping
+    the "stopped" log.
+
+    Updated for Task 6: this originally reproduced the crash via the Task-3
+    skeleton's `_run_loop` stub, which raised `NotImplementedError` on its very
+    first statement. Task 6 replaces that stub with a real reconnect-forever loop
+    that, by design, does NOT crash on an ordinary connection error -- it backs
+    off and retries instead (see test_run_loop_reconnects_after_connection_failure).
+    Real network I/O is also not an option here: with no `_connect` seam configured,
+    the real `_run_loop` would call `websockets.connect()` against this test's fake
+    `wss://buzz.example.com` relay URL, which is real (slow, sandboxing-dependent)
+    network I/O that must never run inside a unit test. So the "already crashed"
+    scenario is now reproduced by monkeypatching `_run_loop` itself to simulate a
+    hypothetical future bug there, while still exercising the REAL
+    (non-monkeypatched) `_spawn_connection` -> real asyncio task path this test
+    is about.
     """
 
     async def run():
         ch = _channel()
+
+        async def crashing_run_loop() -> None:
+            raise RuntimeError("simulated _run_loop bug")
+
+        ch._run_loop = crashing_run_loop
         await ch.start()  # real _spawn_connection: creates a real asyncio task
 
-        # Give the event loop a chance to run the stub _run_loop to completion
-        # (it raises NotImplementedError on its very first statement, so one
-        # or two scheduling turns are enough).
+        # Give the event loop a chance to run the (monkeypatched) _run_loop to
+        # completion (it raises on its very first statement, so one or two
+        # scheduling turns are enough).
         for _ in range(10):
             if ch._task is not None and ch._task.done():
                 break
             await asyncio.sleep(0)
         assert ch._task is not None and ch._task.done()
 
-        await ch.stop()  # must not raise the task's stored NotImplementedError
+        await ch.stop()  # must not raise the task's stored RuntimeError
 
         assert not ch.is_running
         assert ch._task is None
@@ -546,3 +564,157 @@ def test_connect_success_survives_a_failed_confirmation_send(caplog):
     assert captured == []
     assert "failed to bind" not in caplog.text
     assert "failed to send" in caplog.text
+
+
+# -- Task 6: relay connection loop -- connect, NIP-42 auth, subscribe, reconnect --
+
+
+class ScriptedWS:
+    """Async-iterable fake websocket: yields scripted frames, records sends."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.sent = []
+
+    async def send(self, text):
+        self.sent.append(json.loads(text))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.frames:
+            raise StopAsyncIteration
+        return self.frames.pop(0)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_session_authenticates_then_subscribes_with_since_cursor():
+    ch, _ = _started()
+    ch._seen_created_at = 1700000500
+    ws = ScriptedWS(['["AUTH","challenge-1"]'])
+
+    asyncio.run(ch._session(ws))
+    auth_frames = [f for f in ws.sent if f[0] == "AUTH"]
+    req_frames = [f for f in ws.sent if f[0] == "REQ"]
+    assert len(auth_frames) == 1 and auth_frames[0][1]["kind"] == 22242
+    assert ["challenge", "challenge-1"] in auth_frames[0][1]["tags"]
+    assert req_frames, "expected a REQ subscription"
+    kinds = [f0 for f in req_frames for f0 in f[2:] if isinstance(f0, dict)]
+    assert any(9 in f.get("kinds", []) and f.get("since") == 1700000500 for f in kinds)
+    assert any(39000 in f.get("kinds", []) for f in kinds)
+
+
+def test_session_routes_events_through_handle_relay_frame():
+    ch, captured = _started()
+    ws = ScriptedWS([json.dumps(["EVENT", "s", _event()])])
+    asyncio.run(ch._session(ws))
+    assert len(captured) == 1
+
+
+def test_run_loop_reconnects_after_connection_failure():
+    """After a connect failure, _run_loop must back off and retry rather than giving up.
+
+    Correction vs. the brief's literal mock setup: patching `app.channels.buzz.asyncio.sleep`
+    with a bare `unittest.mock.AsyncMock()` patches the *shared* `asyncio` module object (since
+    `buzz.py` does `import asyncio`, not `from asyncio import sleep`), so it also silently
+    replaces the `asyncio.sleep(0)` this test's own polling loop relies on to yield control
+    back to the event loop. A bare AsyncMock's returned coroutine has no real suspension point,
+    so awaiting it never actually hands control back to the scheduler -- verified empirically
+    (see task report) two ways: (a) with the polling loop's own `asyncio.sleep(0)` calls also
+    silently mocked out, the `_run_loop` task never gets scheduled even once, so `attempts`
+    stays empty and the test fails outright; (b) if only the polling loop is protected (e.g. by
+    capturing a `real_sleep` reference before patching) while `_run_loop`'s internal backoff
+    `await asyncio.sleep(delay)` remains a non-yielding mock, `_run_loop` can retry in a genuine
+    infinite tight loop with zero suspension points anywhere in its call chain (mocked connect,
+    trivial ScriptedWS stubs, non-yielding sleep) -- this reproducibly hung the interpreter at
+    100% CPU in manual verification and had to be killed. The fix keeps the mock's call-count
+    bookkeeping (`slept.await_count`) but gives its `side_effect` a genuine zero-duration
+    `asyncio.sleep(0)` (captured before patching, so it cannot recursively call itself),
+    so every backoff still really yields to the loop -- never a real multi-second delay, but
+    never a non-yielding busy spin either. `asyncio.wait_for(..., timeout=10)` is an outer,
+    real-wall-clock safety bound so a future regression here fails fast instead of hanging CI.
+    """
+    ch, _ = _started()
+    attempts = []
+
+    def make_connect():
+        async def connect():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ConnectionError("boom")
+            return ScriptedWS([json.dumps(["EVENT", "s", _event()])])
+
+        return connect
+
+    ch._connect = make_connect()
+
+    async def run():
+        import unittest.mock
+
+        real_sleep = asyncio.sleep  # captured before patching: used by the mock's side_effect
+
+        async def instant_yield(*_args, **_kwargs):
+            await real_sleep(0)  # a genuine, zero-duration event-loop tick -- never real seconds
+
+        with unittest.mock.patch("app.channels.buzz.asyncio.sleep", new=unittest.mock.AsyncMock(side_effect=instant_yield)) as slept:
+            task = asyncio.get_running_loop().create_task(ch._run_loop())
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if len(attempts) >= 2 and task.done() is False and not ch._task:
+                    break
+                if len(attempts) >= 2:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert slept.await_count >= 1  # backed off after the failure
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert len(attempts) >= 2
+
+
+def test_spawn_connection_cannot_fail_start_even_if_connect_immediately_errors():
+    """Carried-forward invariant (from an earlier review, resolved in this task): in start(),
+    `_running = True` is set AFTER `subscribe_outbound()` and `_spawn_connection()`. That was
+    only safe while `_spawn_connection` was a bare `create_task(...)` call that could not itself
+    raise. Task 6 gives `_run_loop` real, potentially-failing connect logic, so this pins that
+    the invariant still holds: `_spawn_connection` remains non-fallible because it still only
+    calls `asyncio.create_task(self._run_loop(), ...)`, which schedules the coroutine and
+    returns without running any of its body -- a connect failure happens later, inside the
+    spawned task, never synchronously inside start(). So even a connect that fails on its very
+    first attempt cannot leave start() partially applied (outbound listener subscribed but
+    `_running` still False, which would make the guarded stop() silently no-op and leak both).
+    """
+
+    async def run():
+        import unittest.mock
+
+        ch = _channel()
+
+        async def immediately_failing_connect():
+            raise RuntimeError("boom-on-first-connect")
+
+        ch._connect = immediately_failing_connect
+
+        with unittest.mock.patch("app.channels.buzz.asyncio.sleep", new=unittest.mock.AsyncMock()):
+            await ch.start()  # must fully commit even though the spawned relay loop will
+            # immediately hit immediately_failing_connect the first time it gets scheduled
+            assert ch.is_running
+            assert ch.bus._outbound_listeners == [ch._on_outbound]
+            assert ch._task is not None
+
+            await ch.stop()  # must cleanly unwind: no leaked listener/task either
+
+        assert not ch.is_running
+        assert ch.bus._outbound_listeners == []
+        assert ch._task is None
+
+    asyncio.run(run())
