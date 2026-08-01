@@ -1,6 +1,6 @@
 # IM Channel Connections
 
-DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, and WeCom. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
+DeerFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, WeCom, and Buzz. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by DeerFlow.
 
 No public IP, OAuth callback URL, or provider webhook is required in this implementation.
 
@@ -278,6 +278,11 @@ channels:
     enabled: true
     bot_id: $WECOM_BOT_ID
     bot_secret: $WECOM_BOT_SECRET
+
+  buzz:
+    enabled: true
+    relay_url: wss://buzz.example.com
+    private_key: $BUZZ_PRIVATE_KEY   # hex or nsec1…
 ```
 
 Then enable user bindings in `channel_connections`:
@@ -312,6 +317,9 @@ channel_connections:
 
   wecom:
     enabled: true
+
+  buzz:
+    enabled: true
 ```
 
 `channel_connections` does not duplicate provider secrets. It only controls the browser-facing connect UI and stores per-user binding records. Telegram needs `bot_username` only so the frontend can open a deep link.
@@ -345,6 +353,15 @@ Feishu/Lark, DingTalk, WeChat, and WeCom:
 - The frontend creates a short one-time code.
 - The UI shows `Send /connect <code> to the DeerFlow <Provider> bot.`
 - The already-running long-connection or polling worker receives the message and binds the platform user/workspace identity to the current DeerFlow user.
+
+Buzz:
+
+- Unlike the bot/app credentials above, Buzz has no separate developer console: DeerFlow joins the relay as an ordinary member identity. Generate a Nostr keypair for that identity, then register its public key as a relay member using the Buzz relay's own admin tooling (`buzz-admin add-member <pubkey>` — see the [Buzz project](https://github.com/block/buzz)).
+- Configure `relay_url` and `private_key` (hex or `nsec1…`) under `channels.buzz`, then enable `channel_connections.buzz`.
+- The frontend creates a short one-time code.
+- The UI shows `Send /connect <code> to the DeerFlow Buzz bot.`
+- The already-running Buzz relay-loop worker receives the message — sent as a DM or an @mention — and binds the sender's Nostr pubkey to the current DeerFlow user.
+- Requires the `buzz` dependency extra (`uv sync --extra buzz`) for the `coincurve` library.
 
 Codes use 128 bits of randomness, expire after 10 minutes, and are single-use.
 

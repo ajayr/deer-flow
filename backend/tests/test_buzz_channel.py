@@ -718,3 +718,33 @@ def test_spawn_connection_cannot_fail_start_even_if_connect_immediately_errors()
         assert ch._task is None
 
     asyncio.run(run())
+
+
+# -- Task 7: channel_connections config + browser provider wiring -----------------
+
+
+def test_channel_connections_config_knows_buzz():
+    """Correction vs. the brief's literal expected value: `provider_status()`
+    computes `configured = enabled and bool(config.configured)`, so a disabled
+    provider is always reported as `configured: False` -- confirmed by every
+    sibling provider in test_channel_connections_config.py::
+    test_provider_status_reports_disabled_and_unknown_providers (all
+    {"enabled": False, "configured": False} on a default/disabled config).
+    Buzz's `BindingCodeChannelConnectionConfig` (always-True `configured`
+    property, same as discord/feishu/dingtalk/wechat/wecom) is therefore
+    indistinguishable from its siblings here until it is also enabled."""
+    from deerflow.config.channel_connections_config import ChannelConnectionsConfig
+
+    cfg = ChannelConnectionsConfig()
+    assert cfg.provider_status("buzz") == {"enabled": False, "configured": False}
+
+    enabled_cfg = ChannelConnectionsConfig.model_validate({"enabled": True, "buzz": {"enabled": True}})
+    assert enabled_cfg.provider_status("buzz") == {"enabled": True, "configured": True}
+
+
+def test_browser_provider_wiring_for_buzz():
+    from app.gateway.routers import channel_connections as cc
+
+    assert cc._PROVIDER_META["buzz"] == {"display_name": "Buzz", "auth_mode": "binding_code"}
+    assert {f["name"] for f in cc._CREDENTIAL_FIELDS["buzz"]} == {"relay_url", "private_key"}
+    assert cc._RUNTIME_REQUIREMENTS["buzz"] == ("relay_url", "private_key")
