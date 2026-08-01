@@ -59,3 +59,63 @@ def test_start_and_stop_manage_outbound_subscription():
         assert not ch.is_running and ch.bus._outbound_listeners == []
 
     asyncio.run(run())
+
+
+def test_start_is_idempotent_against_double_start():
+    """A second start() while already running must not double-subscribe or re-spawn.
+
+    Reproduces the review finding that calling start() twice appended
+    `_on_outbound` to `bus._outbound_listeners` twice and spawned a second
+    concurrent relay-loop task, since the original skeleton had no
+    re-entrancy guard (unlike github.py / discord.py's `if self._running:
+    return`).
+    """
+
+    async def run():
+        ch = _channel()
+        spawn_calls = 0
+
+        def fake_spawn() -> None:
+            nonlocal spawn_calls
+            spawn_calls += 1
+
+        ch._spawn_connection = fake_spawn
+
+        await ch.start()
+        await ch.start()  # must be a no-op: already running
+
+        assert ch.bus._outbound_listeners == [ch._on_outbound]
+        assert spawn_calls == 1
+
+    asyncio.run(run())
+
+
+def test_stop_is_safe_after_the_relay_task_already_crashed():
+    """stop() must not re-raise a stored exception from an already-finished task.
+
+    Reproduces the review finding that, after a real (non-monkeypatched)
+    start(), the stubbed _run_loop() raises NotImplementedError almost
+    immediately; a later stop() awaited the finished task and only caught
+    CancelledError/TimeoutError, so the NotImplementedError propagated out
+    of stop() — leaving `_task` non-None and skipping the "stopped" log.
+    """
+
+    async def run():
+        ch = _channel()
+        await ch.start()  # real _spawn_connection: creates a real asyncio task
+
+        # Give the event loop a chance to run the stub _run_loop to completion
+        # (it raises NotImplementedError on its very first statement, so one
+        # or two scheduling turns are enough).
+        for _ in range(10):
+            if ch._task is not None and ch._task.done():
+                break
+            await asyncio.sleep(0)
+        assert ch._task is not None and ch._task.done()
+
+        await ch.stop()  # must not raise the task's stored NotImplementedError
+
+        assert not ch.is_running
+        assert ch._task is None
+
+    asyncio.run(run())

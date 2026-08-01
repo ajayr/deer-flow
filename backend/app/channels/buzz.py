@@ -43,6 +43,8 @@ class BuzzChannel(Channel):
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
+        if self._running:
+            return
         self._keys = buzz_nostr.parse_private_key(self._private_key_raw)
         self.bus.subscribe_outbound(self._on_outbound)
         self._spawn_connection()
@@ -53,15 +55,24 @@ class BuzzChannel(Channel):
         self._task = asyncio.create_task(self._run_loop(), name="buzz-relay-loop")
 
     async def stop(self) -> None:
+        if not self._running:
+            return
         self._running = False
         self.bus.unsubscribe_outbound(self._on_outbound)
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            task.cancel()
             try:
-                await asyncio.wait_for(self._task, timeout=5)
+                await asyncio.wait_for(task, timeout=5)
             except (asyncio.CancelledError, TimeoutError):
                 pass
-            self._task = None
+            except Exception:
+                # Task 6 replaces the stub _run_loop; until then (and even after, for a
+                # genuine crash) stop() must still complete cleanly rather than re-raise
+                # whatever the relay loop task ended with.
+                logger.exception("[buzz] relay loop task ended with an error during stop")
+            finally:
+                self._task = None
         logger.info("[buzz] channel stopped")
 
     async def _run_loop(self) -> None:  # implemented in Task 6
