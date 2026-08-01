@@ -101,3 +101,41 @@ def sign_event(keys: NostrKeys, kind: int, tags: list[list[str]], content: str, 
     eid = event_id(keys.pubkey_hex, created_at, kind, tags, content)
     sig = coincurve.PrivateKey(keys.secret).sign_schnorr(bytes.fromhex(eid))
     return {"id": eid, "pubkey": keys.pubkey_hex, "created_at": created_at, "kind": kind, "tags": tags, "content": content, "sig": sig.hex()}
+
+
+KIND_CHAT = 9
+KIND_EDIT = 40003
+KIND_AUTH = 22242
+KIND_CHANNEL_META = 39000
+
+
+def build_auth_event(keys: NostrKeys, relay_url: str, challenge: str, created_at: int) -> dict:
+    return sign_event(keys, KIND_AUTH, [["relay", relay_url], ["challenge", challenge]], "", created_at)
+
+
+def build_chat_event(keys: NostrKeys, channel_id: str, content: str, created_at: int, reply_to: str | None = None, mentions: tuple[str, ...] = ()) -> dict:
+    tags: list[list[str]] = [["h", channel_id]]
+    if reply_to:
+        tags.append(["e", reply_to])
+    tags.extend(["p", m] for m in mentions)
+    return sign_event(keys, KIND_CHAT, tags, content, created_at)
+
+
+def build_edit_event(keys: NostrKeys, channel_id: str, target_event_id: str, content: str, created_at: int) -> dict:
+    return sign_event(keys, KIND_EDIT, [["h", channel_id], ["e", target_event_id]], content, created_at)
+
+
+def req_frame(sub_id: str, *filters: dict) -> str:
+    return json.dumps(["REQ", sub_id, *filters], separators=(",", ":"))
+
+
+def event_frame(event: dict) -> str:
+    return json.dumps(["EVENT", event], separators=(",", ":"))
+
+
+def close_frame(sub_id: str) -> str:
+    return json.dumps(["CLOSE", sub_id], separators=(",", ":"))
+
+
+def tag_values(event: dict, name: str) -> list[str]:
+    return [t[1] for t in event.get("tags", []) if len(t) >= 2 and t[0] == name]

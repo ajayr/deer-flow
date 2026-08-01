@@ -1,5 +1,7 @@
 """Tests for the pure Nostr helpers behind the Buzz channel connector."""
 
+import json
+
 import pytest
 
 coincurve = pytest.importorskip("coincurve")
@@ -46,3 +48,44 @@ def test_sign_event_produces_valid_schnorr_signature():
     assert ev["pubkey"] == PK3_HEX and ev["kind"] == 9 and ev["tags"] == [["h", CHANNEL]]
     xonly = coincurve.PublicKeyXOnly(bytes.fromhex(PK3_HEX))
     assert xonly.verify(bytes.fromhex(ev["sig"]), bytes.fromhex(ev["id"]))
+
+
+def _keys():
+    return buzz_nostr.parse_private_key(SK3_HEX)
+
+
+def test_build_auth_event_carries_relay_and_challenge_tags():
+    ev = buzz_nostr.build_auth_event(_keys(), "wss://buzz.example.com", "abc123", created_at=1700000001)
+    assert ev["kind"] == 22242
+    assert ["relay", "wss://buzz.example.com"] in ev["tags"] and ["challenge", "abc123"] in ev["tags"]
+
+
+def test_build_chat_event_tags_channel_reply_and_mentions():
+    ev = buzz_nostr.build_chat_event(_keys(), CHANNEL, "hi", created_at=1700000002, reply_to="ab" * 32, mentions=("cd" * 32,))
+    assert ev["kind"] == 9
+    assert ["h", CHANNEL] in ev["tags"] and ["e", "ab" * 32] in ev["tags"] and ["p", "cd" * 32] in ev["tags"]
+
+
+def test_build_chat_event_minimal_has_only_channel_tag():
+    ev = buzz_nostr.build_chat_event(_keys(), CHANNEL, "hi", created_at=1700000002)
+    assert ev["tags"] == [["h", CHANNEL]]
+
+
+def test_build_edit_event_targets_existing_message():
+    ev = buzz_nostr.build_edit_event(_keys(), CHANNEL, "ef" * 32, "new text", created_at=1700000003)
+    assert ev["kind"] == 40003
+    assert ev["tags"] == [["h", CHANNEL], ["e", "ef" * 32]] and ev["content"] == "new text"
+
+
+def test_frames_serialize_as_nostr_wire_arrays():
+    req = json.loads(buzz_nostr.req_frame("sub1", {"kinds": [9]}, {"kinds": [39000]}))
+    assert req == ["REQ", "sub1", {"kinds": [9]}, {"kinds": [39000]}]
+    ev = buzz_nostr.build_chat_event(_keys(), CHANNEL, "x", created_at=1700000004)
+    assert json.loads(buzz_nostr.event_frame(ev)) == ["EVENT", ev]
+    assert json.loads(buzz_nostr.close_frame("sub1")) == ["CLOSE", "sub1"]
+
+
+def test_tag_values_extracts_all_matching_tags():
+    ev = {"tags": [["p", "aa"], ["p", "bb"], ["h", CHANNEL]]}
+    assert buzz_nostr.tag_values(ev, "p") == ["aa", "bb"]
+    assert buzz_nostr.tag_values(ev, "t") == []
