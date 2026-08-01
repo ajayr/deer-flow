@@ -9,8 +9,9 @@ import pytest
 
 pytest.importorskip("coincurve")
 
+from app.channels import buzz_nostr
 from app.channels.base import Channel
-from app.channels.buzz import BuzzChannel, _chunk_text
+from app.channels.buzz import EDIT_MAX_BYTES, MAX_CACHED_CHANNELS, BuzzChannel, _chunk_text
 from app.channels.manager import CHANNEL_CAPABILITIES
 from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage
 from app.channels.run_policy import CHANNEL_RUN_POLICY
@@ -18,7 +19,17 @@ from app.channels.service import _CHANNEL_CREDENTIAL_KEYS, _CHANNEL_REGISTRY
 
 SK3_HEX = "0000000000000000000000000000000000000000000000000000000000000003"
 PK3_HEX = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
-OWNER = "dd" * 32
+
+# Review FINDING 4 made inbound events signature-verified, so test authors can no
+# longer be arbitrary hex strings ("dd" * 32 has no private key and therefore no
+# signature): every fixture author is now a real keypair whose events are signed
+# exactly the way a relay member's client would sign them.
+SK_OWNER = "0000000000000000000000000000000000000000000000000000000000000005"
+SK_OUTSIDER = "0000000000000000000000000000000000000000000000000000000000000007"
+SK_NEWCOMER = "0000000000000000000000000000000000000000000000000000000000000009"
+OWNER = buzz_nostr.parse_private_key(SK_OWNER).pubkey_hex  # the one allowlisted author
+OUTSIDER = buzz_nostr.parse_private_key(SK_OUTSIDER).pubkey_hex  # relay member, not allowlisted
+NEWCOMER = buzz_nostr.parse_private_key(SK_NEWCOMER).pubkey_hex  # not allowlisted; binds via /connect
 CHANNEL = "136852ee-63e1-49c2-8927-413b5ee8e5f7"
 
 
@@ -142,17 +153,22 @@ def test_stop_is_safe_after_the_relay_task_already_crashed():
     asyncio.run(run())
 
 
-def _event(*, pubkey=OWNER, kind=9, content="@DeerFlow hello", channel=CHANNEL, mentions=(PK3_HEX,), reply_to=None, eid="11" * 32, created_at=1700000100):
+def _event(*, sk=SK_OWNER, kind=9, content="@DeerFlow hello", channel=CHANNEL, mentions=(PK3_HEX,), reply_to=None, created_at=1700000100):
+    """Build a REAL relay event: signed by *sk*, with the id the relay would see.
+
+    Since FINDING 4 the connector verifies both, so a hand-built dict with a made-up
+    id and no `sig` is now indistinguishable from a relay-forged event -- and is
+    dropped as one. Fixtures must therefore be authentic."""
     tags = [["h", channel]]
     if reply_to:
         tags.append(["e", reply_to])
     tags.extend(["p", m] for m in mentions)
-    return {"id": eid, "pubkey": pubkey, "created_at": created_at, "kind": kind, "tags": tags, "content": content}
+    return buzz_nostr.sign_event(buzz_nostr.parse_private_key(sk), kind, tags, content, created_at)
 
 
 def _started(**overrides):
     ch = _channel(**overrides)
-    ch._keys = __import__("app.channels.buzz_nostr", fromlist=["x"]).parse_private_key(SK3_HEX)
+    ch._keys = buzz_nostr.parse_private_key(SK3_HEX)
     captured = []
 
     async def publish(msg):
@@ -163,31 +179,30 @@ def _started(**overrides):
 
 
 def _dispatch(ch, ev):
-    import json
-
     asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "sub1", ev])))
 
 
 def test_mentioned_allowed_author_is_published():
     ch, captured = _started()
-    _dispatch(ch, _event())
+    ev = _event()
+    _dispatch(ch, ev)
     assert len(captured) == 1
     msg = captured[0]
     assert msg.channel_name == "buzz" and msg.chat_id == CHANNEL and msg.user_id == OWNER
     assert msg.text == "hello"  # own leading @mention stripped
-    assert msg.metadata["event_id"] == "11" * 32 and msg.workspace_id == "buzz.example.com"
+    assert msg.metadata["event_id"] == ev["id"] and msg.workspace_id == "buzz.example.com"
     assert msg.msg_type == InboundMessageType.CHAT
 
 
 def test_disallowed_author_is_dropped():
     ch, captured = _started()
-    _dispatch(ch, _event(pubkey="ee" * 32))
+    _dispatch(ch, _event(sk=SK_OUTSIDER))
     assert captured == []
 
 
 def test_own_events_are_ignored():
     ch, captured = _started()
-    _dispatch(ch, _event(pubkey=PK3_HEX))
+    _dispatch(ch, _event(sk=SK3_HEX))
     assert captured == []
 
 
@@ -196,7 +211,7 @@ def test_unmentioned_channel_message_is_dropped_but_dm_passes():
     _dispatch(ch, _event(content="no mention here", mentions=()))
     assert captured == []
     ch._handle_meta_event({"kind": 39000, "tags": [["d", CHANNEL], ["t", "dm"], ["name", "DM"]]})
-    _dispatch(ch, _event(content="dm without mention", mentions=(), eid="22" * 32))
+    _dispatch(ch, _event(content="dm without mention", mentions=()))
     assert len(captured) == 1 and captured[0].text == "dm without mention"
 
 
@@ -211,7 +226,7 @@ def test_mention_free_channel_and_thread_follow_pass_without_mention():
 
     ch2, captured2 = _started()
     ch2.config["channel_store"] = FakeStore()
-    _dispatch(ch2, _event(content="follow-up", mentions=(), reply_to="aa" * 32, eid="33" * 32))
+    _dispatch(ch2, _event(content="follow-up", mentions=(), reply_to="aa" * 32))
     assert len(captured2) == 1 and captured2[0].topic_id == "aa" * 32
 
 
@@ -236,12 +251,21 @@ def test_auth_frame_records_challenge_and_meta_defaults_fail_closed():
 
 
 class FakeConnectionRepo:
-    """Minimal test double for ChannelConnectionRepository: consume + upsert only."""
+    """Minimal test double for ChannelConnectionRepository: consume, upsert, and lookup.
+
+    The lookup half was added for the review finding that the `/connect` bind was
+    write-only, so it stores what `upsert_connection` wrote under the same
+    (provider, external_account_id, workspace_id) identity the real repository keys
+    on -- a lookup with the wrong workspace therefore misses, exactly as it would
+    against SQL.
+    """
 
     def __init__(self, *, states=None, raise_on_consume=False):
         self._states = dict(states or {})
         self._raise_on_consume = raise_on_consume
+        self._connections: dict[tuple, dict] = {}
         self.upserts = []
+        self.lookups = []
 
     async def consume_oauth_state(self, *, provider, state, now=None):
         if self._raise_on_consume:
@@ -253,7 +277,13 @@ class FakeConnectionRepo:
 
     async def upsert_connection(self, **kwargs):
         self.upserts.append(kwargs)
-        return {"id": "conn-1", **kwargs}
+        connection = {"id": f"conn-{len(self.upserts)}", **kwargs}
+        self._connections[(kwargs["provider"], kwargs["external_account_id"], kwargs.get("workspace_id"))] = connection
+        return connection
+
+    async def find_connection_by_external_identity(self, *, provider, external_account_id, workspace_id=None):
+        self.lookups.append({"provider": provider, "external_account_id": external_account_id, "workspace_id": workspace_id})
+        return self._connections.get((provider, external_account_id, workspace_id))
 
 
 def test_connect_code_binds_and_never_publishes_even_for_unauthorized_author():
@@ -261,11 +291,11 @@ def test_connect_code_binds_and_never_publishes_even_for_unauthorized_author():
     must bind via the connection repo and never reach _publish as a chat message."""
     repo = FakeConnectionRepo(states={"tok-1": "owner-xyz"})
     ch, captured = _started(connection_repo=repo)
-    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect tok-1", mentions=()))
+    _dispatch(ch, _event(sk=SK_OUTSIDER, content="/connect tok-1", mentions=()))
     assert captured == []
     assert len(repo.upserts) == 1
     assert repo.upserts[0]["owner_user_id"] == "owner-xyz"
-    assert repo.upserts[0]["external_account_id"] == "ee" * 32
+    assert repo.upserts[0]["external_account_id"] == OUTSIDER
     assert repo.upserts[0]["provider"] == "buzz"
 
 
@@ -273,7 +303,7 @@ def test_connect_code_invalid_never_publishes_and_does_not_bind():
     """An unrecognized/expired code must still never publish, and must not upsert."""
     repo = FakeConnectionRepo()
     ch, captured = _started(connection_repo=repo)
-    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect not-a-real-code", mentions=()))
+    _dispatch(ch, _event(sk=SK_OUTSIDER, content="/connect not-a-real-code", mentions=()))
     assert captured == []
     assert repo.upserts == []
 
@@ -283,7 +313,7 @@ def test_connect_code_repo_error_never_publishes_and_does_not_crash():
     and must still never fall through to publish."""
     repo = FakeConnectionRepo(raise_on_consume=True)
     ch, captured = _started(connection_repo=repo)
-    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect tok-1", mentions=()))
+    _dispatch(ch, _event(sk=SK_OUTSIDER, content="/connect tok-1", mentions=()))
     assert captured == []
 
 
@@ -292,7 +322,7 @@ def test_connect_code_never_publishes_even_for_already_allowed_and_mentioned_aut
     even when the author is already allowlisted and mentioned."""
     repo = FakeConnectionRepo(states={"tok-2": "owner-abc"})
     ch, captured = _started(connection_repo=repo)
-    _dispatch(ch, _event(pubkey=OWNER, content="/connect tok-2", mentions=(PK3_HEX,)))
+    _dispatch(ch, _event(sk=SK_OWNER, content="/connect tok-2", mentions=(PK3_HEX,)))
     assert captured == []
     assert len(repo.upserts) == 1 and repo.upserts[0]["external_account_id"] == OWNER
 
@@ -300,12 +330,12 @@ def test_connect_code_never_publishes_even_for_already_allowed_and_mentioned_aut
 def test_known_command_classifies_as_command_but_plain_text_stays_chat():
     """FINDING 3: is_known_channel_command classification had no direct coverage."""
     ch, captured = _started()
-    _dispatch(ch, _event(content="@DeerFlow /goal ship it", mentions=(PK3_HEX,), eid="44" * 32))
+    _dispatch(ch, _event(content="@DeerFlow /goal ship it", mentions=(PK3_HEX,)))
     assert len(captured) == 1
     assert captured[0].msg_type == InboundMessageType.COMMAND
     assert captured[0].text == "/goal ship it"
 
-    _dispatch(ch, _event(content="@DeerFlow just chatting", mentions=(PK3_HEX,), eid="55" * 32))
+    _dispatch(ch, _event(content="@DeerFlow just chatting", mentions=(PK3_HEX,)))
     assert len(captured) == 2
     assert captured[1].msg_type == InboundMessageType.CHAT
 
@@ -518,12 +548,12 @@ def test_connect_success_sends_confirmation_reply():
     ch, captured = _started(connection_repo=repo)
     transport = FakeTransport()
     ch._transport = transport
-    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-conf", mentions=()))
+    _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect tok-conf", mentions=()))
     events = _events_of(transport)
     assert len(events) == 1
     assert events[0]["kind"] == 9
     assert events[0]["content"] == "Buzz connected to DeerFlow."
-    assert ["p", "ff" * 32] in events[0]["tags"]
+    assert ["p", NEWCOMER] in events[0]["tags"]
     assert captured == []  # still never published as a chat message
 
 
@@ -532,7 +562,7 @@ def test_connect_invalid_code_sends_error_reply():
     ch, captured = _started(connection_repo=repo)
     transport = FakeTransport()
     ch._transport = transport
-    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect not-a-real-code", mentions=()))
+    _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect not-a-real-code", mentions=()))
     (event,) = _events_of(transport)
     assert event["content"] == "Buzz connection code is invalid or expired."
 
@@ -542,7 +572,7 @@ def test_connect_repo_error_sends_error_reply_and_does_not_crash():
     ch, captured = _started(connection_repo=repo)
     transport = FakeTransport()
     ch._transport = transport
-    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-1", mentions=()))
+    _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect tok-1", mentions=()))
     (event,) = _events_of(transport)
     assert event["content"] == "Buzz connection could not be completed from this message."
 
@@ -557,7 +587,7 @@ def test_connect_success_survives_a_failed_confirmation_send(caplog):
     repo = FakeConnectionRepo(states={"tok-fail-send": "owner-fail-send"})
     ch, captured = _started(connection_repo=repo)
     with caplog.at_level(logging.INFO, logger="app.channels.buzz"):
-        _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-fail-send", mentions=()))
+        _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect tok-fail-send", mentions=()))
 
     assert len(repo.upserts) == 1  # the bind itself succeeded despite the failed reply
     assert repo.upserts[0]["owner_user_id"] == "owner-fail-send"
@@ -748,3 +778,322 @@ def test_browser_provider_wiring_for_buzz():
     assert cc._PROVIDER_META["buzz"] == {"display_name": "Buzz", "auth_mode": "binding_code"}
     assert {f["name"] for f in cc._CREDENTIAL_FIELDS["buzz"]} == {"relay_url", "private_key"}
     assert cc._RUNTIME_REQUIREMENTS["buzz"] == ("relay_url", "private_key")
+
+
+# -- FINAL REVIEW FINDING 1 (Critical): the resubscribe cursor is peer-controlled --
+
+
+def test_future_dated_event_from_a_dropped_author_never_moves_the_cursor():
+    """Reproduces the remote DoS: any relay member -- allowlisted or not -- publishes
+    one kind-9 event stamped year-5138. The event is correctly dropped by the
+    allowlist, but the watermark used to be advanced BEFORE that gate, so every
+    later REQ carried `since=99999999999999` and the connector went permanently
+    deaf on this and every future connection, with no log and no recovery short of
+    a process restart."""
+    ch, captured = _started()
+    _dispatch(ch, _event(sk=SK_OUTSIDER, created_at=99999999999999))
+    assert captured == []
+    assert ch._seen_created_at == 0
+    assert all("since" not in f for f in ch._subscription_filters())
+
+
+def test_future_dated_event_from_an_allowlisted_author_is_delivered_but_capped():
+    """The clamp is independent of the allowlist: an authorized member with a badly
+    skewed (or deliberately absurd) clock still gets their message through, but must
+    not be able to blind the connector's next reconnect either."""
+    ch, captured = _started()
+    _dispatch(ch, _event(created_at=99999999999999))
+    assert len(captured) == 1
+    assert ch._seen_created_at == 0
+
+
+def test_dropped_event_with_a_plausible_timestamp_also_leaves_the_cursor_alone():
+    """Advance-on-accept, not advance-on-receive: a non-allowlisted member's ordinary
+    message must not silently move the cursor past events we would have accepted."""
+    ch, captured = _started()
+    _dispatch(ch, _event(sk=SK_OUTSIDER, created_at=1700000400))
+    assert captured == []
+    assert ch._seen_created_at == 0
+
+
+def test_accepted_event_advances_the_cursor_and_rides_the_next_subscription():
+    ch, captured = _started()
+    _dispatch(ch, _event(created_at=1700000300))
+    assert len(captured) == 1
+    assert ch._seen_created_at == 1700000300
+    assert ch._subscription_filters()[0]["since"] == 1700000300
+
+
+def test_a_handled_connect_advances_the_cursor_but_a_forged_one_does_not():
+    """A fully processed /connect may advance the cursor (otherwise every reconnect
+    replays it and answers with a spurious "code invalid or expired"), while an event
+    that never gets processed at all must not."""
+    repo = FakeConnectionRepo(states={"tok-cursor": "owner-cursor"})
+    ch, _ = _started(connection_repo=repo)
+    ch._transport = FakeTransport()
+    _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect tok-cursor", mentions=(), created_at=1700000250))
+    assert ch._seen_created_at == 1700000250
+
+    forged = _event(sk=SK_OUTSIDER, content="/connect tok-cursor", mentions=(), created_at=1700000600)
+    forged["content"] = "/connect tok-cursor-tampered"  # breaks the signature
+    _dispatch(ch, forged)
+    assert ch._seen_created_at == 1700000250
+
+
+# -- FINAL REVIEW FINDING 2 (Important): /connect binds were never resolved inbound --
+
+
+def test_bound_pubkey_inbound_message_carries_the_connection_identity():
+    """Without `attach_connection_identity` the whole browser-connections feature was
+    inert for Buzz: `connection_id`/`owner_user_id` stayed None, so the manager ran the
+    turn under a synthetic pubkey-derived user (its own memory + file buckets) instead
+    of the bound DeerFlow account, and DELETE /api/channels/connections/{id} had no
+    runtime effect."""
+    repo = FakeConnectionRepo(states={"tok-bind": "owner-bound"})
+    ch, captured = _started(connection_repo=repo)
+    ch._transport = FakeTransport()
+
+    _dispatch(ch, _event(sk=SK_OWNER, content="/connect tok-bind", mentions=()))
+    assert len(repo.upserts) == 1
+
+    _dispatch(ch, _event(sk=SK_OWNER))
+    assert len(captured) == 1
+    assert captured[0].connection_id == "conn-1"
+    assert captured[0].owner_user_id == "owner-bound"
+    assert captured[0].workspace_id == "buzz.example.com"
+    # Scoped to this relay: a bind written for buzz.example.com must be looked up the
+    # same way, and never through a workspace-less fallback that would resolve a
+    # pubkey bound on some *other* relay.
+    assert repo.lookups[-1] == {"provider": "buzz", "external_account_id": OWNER, "workspace_id": "buzz.example.com"}
+
+
+def test_unbound_pubkey_inbound_message_carries_no_connection_identity():
+    repo = FakeConnectionRepo()
+    ch, captured = _started(connection_repo=repo)
+    _dispatch(ch, _event())
+    assert len(captured) == 1
+    assert captured[0].connection_id is None and captured[0].owner_user_id is None
+    assert captured[0].workspace_id == "buzz.example.com"
+    assert [lookup["workspace_id"] for lookup in repo.lookups] == ["buzz.example.com"]
+
+
+# -- FINAL REVIEW FINDING 3 (Important): oversize streaming re-posted the tail ------
+
+
+def _visible_conversation(transport):
+    """Replay posts + edits the way a Buzz client renders them: id -> current text."""
+    visible, order = {}, []
+    for ev in _events_of(transport):
+        if ev["kind"] == 9:
+            visible[ev["id"]] = ev["content"]
+            order.append(ev["id"])
+        else:
+            target = next(t[1] for t in ev["tags"] if t[0] == "e")
+            visible[target] = ev["content"]
+    return [visible[eid] for eid in order]
+
+
+def test_successive_oversize_updates_edit_the_tail_instead_of_reposting_it():
+    """The manager publishes CUMULATIVE text on every streaming update, so an oversize
+    reply re-splits into >= 2 chunks on EVERY update. `chunks[1:]` used to be posted as
+    brand-new, untracked kind-9 messages each time -- a realistic 100KB answer at
+    ~1 update/sec flooded the channel with dozens of near-duplicate tails. Posts must
+    now be bounded by the number of distinct chunk INDEXES ever needed."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    updates = ["x" * (EDIT_MAX_BYTES + 1_000), "y" * (EDIT_MAX_BYTES + 20_000), "z" * (2 * EDIT_MAX_BYTES + 1_000)]
+    assert [len(_chunk_text(t)) for t in updates] == [2, 2, 3]  # the shape this test is about
+    for index, text in enumerate(updates):
+        asyncio.run(ch.send(_outbound(ch, text, is_final=index == len(updates) - 1)))
+
+    events = _events_of(transport)
+    posts = [e for e in events if e["kind"] == 9]
+    edits = [e for e in events if e["kind"] == 40003]
+    assert len(posts) == 3  # one per distinct chunk index (was 5: a fresh tail per update)
+    assert len(edits) == 4  # chunk 0 twice, tail 0 twice
+    assert "".join(_visible_conversation(transport)) == updates[-1]
+    assert (CHANNEL, None) not in ch._stream_tails  # final clears the tail bookkeeping too
+
+
+def test_repeated_oversize_updates_of_a_stable_size_post_nothing_new():
+    """The flood's worst case: N updates that never grow past two chunks must produce
+    exactly two messages in the channel, no matter how many updates arrive."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    def update(i):
+        return f"u{i}" * (EDIT_MAX_BYTES // 2 + 500)  # 61_000 bytes: always exactly 2 chunks
+
+    for i in range(6):
+        asyncio.run(ch.send(_outbound(ch, update(i), is_final=i == 5)))
+
+    posts = [e for e in _events_of(transport) if e["kind"] == 9]
+    assert len(posts) == 2  # was 7: one placeholder plus a fresh tail on every update
+    assert "".join(_visible_conversation(transport)) == update(5)
+
+
+def test_tail_bookkeeping_is_cleared_even_when_a_final_oversize_send_fails(monkeypatch):
+    """Same invariant the placeholder already had: a raised FINAL send must not leave
+    tail ids behind for the next run to edit."""
+    monkeypatch.setattr("app.channels.base.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    key = (CHANNEL, None)
+    asyncio.run(ch.send(_outbound(ch, "a" * (EDIT_MAX_BYTES + 1_000), is_final=False)))
+    assert len(ch._stream_tails[key]) == 1
+
+    class AlwaysFailingTransport:
+        async def send(self, text):
+            raise RuntimeError("relay down")
+
+    ch._transport = AlwaysFailingTransport()
+    with pytest.raises(RuntimeError):
+        asyncio.run(ch.send(_outbound(ch, "b" * (EDIT_MAX_BYTES + 1_000), is_final=True)))
+    assert key not in ch._stream_tails and key not in ch._stream_targets
+
+
+# -- FINAL REVIEW FINDING 4 (Important): events were never signature-verified -------
+
+
+def test_event_with_a_tampered_payload_never_reaches_publish():
+    ch, captured = _started()
+    ev = _event()
+    ev["content"] = "@DeerFlow rm -rf /mnt/user-data"  # rewritten in flight by the relay
+    _dispatch(ch, ev)
+    assert captured == []
+
+
+def test_relay_cannot_forge_an_allowlisted_author():
+    """`ev["pubkey"]` is the authorization principal, and on a team-run relay the relay
+    operator is not necessarily the DeerFlow operator: an unverified pubkey field let a
+    malicious relay name an allowlisted author and trigger tool-executing runs."""
+    ch, captured = _started()
+    ev = _event(sk=SK_OUTSIDER)  # genuinely signed by a non-allowlisted member
+    ev["pubkey"] = OWNER  # ... but delivered claiming the allowlisted one
+    _dispatch(ch, ev)
+    assert captured == []
+
+
+def test_relay_cannot_forge_a_connect_event_to_bind_another_members_pubkey():
+    """The bind path consumes `pubkey` too: forging it would bind a victim's identity to
+    the attacker's DeerFlow account, so verification has to happen before /connect."""
+    repo = FakeConnectionRepo(states={"tok-forge": "attacker"})
+    ch, captured = _started(connection_repo=repo)
+    ev = _event(sk=SK_OUTSIDER, content="/connect tok-forge", mentions=())
+    ev["pubkey"] = OWNER
+    _dispatch(ch, ev)
+    assert repo.upserts == [] and captured == []
+
+
+def test_unsigned_channel_metadata_is_rejected_before_it_can_relax_the_mention_gate():
+    ch, captured = _started()
+    fake_meta = {"id": "aa" * 32, "pubkey": OUTSIDER, "created_at": 1700000000, "kind": 39000, "tags": [["d", CHANNEL], ["t", "dm"]], "content": "", "sig": "00" * 64}
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "s", fake_meta])))
+    assert ch._channel_meta == {}
+    _dispatch(ch, _event(content="dm without mention", mentions=()))
+    assert captured == []
+
+
+def test_signed_channel_metadata_is_still_cached_and_still_grants_the_dm_exemption():
+    """Verification must not break the legitimate path it guards."""
+    ch, captured = _started()
+    meta = buzz_nostr.sign_event(buzz_nostr.parse_private_key(SK_OUTSIDER), 39000, [["d", CHANNEL], ["t", "dm"], ["name", "Ops DM"]], "", 1700000050)
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "s", meta])))
+    assert ch._channel_meta[CHANNEL] == {"type": "dm", "name": "Ops DM"}
+    _dispatch(ch, _event(content="dm without mention", mentions=()))
+    assert len(captured) == 1
+
+
+# -- FINAL REVIEW FINDING 5: operability + bounded remote-fed state ----------------
+
+
+def test_empty_allowlist_warns_at_startup(caplog):
+    """Buzz keeps deny-by-default semantics (siblings treat empty as allow-all), so a
+    misconfigured operator must not be left with a silently dead channel."""
+
+    async def run():
+        ch = _channel(allowed_users=[])
+        ch._spawn_connection = lambda: None
+        with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+            await ch.start()
+        await ch.stop()
+
+    asyncio.run(run())
+    assert "allowed_users is empty" in caplog.text
+
+
+def test_allowlist_drop_is_logged_at_debug(caplog):
+    ch, captured = _started()
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        _dispatch(ch, _event(sk=SK_OUTSIDER))
+    assert captured == []
+    assert "non-allowlisted" in caplog.text
+
+
+def test_stop_is_bounded_and_coherent_when_the_relay_loop_ignores_cancellation(monkeypatch, caplog):
+    """`asyncio.wait_for` waits for the cancelled task to actually finish, so a loop that
+    swallows CancelledError hung stop() forever instead of timing out; and the timeout
+    path dropped `_task` while the task might still own `_transport`, leaving an
+    abandoned task posting on a socket the channel believed it had released."""
+    monkeypatch.setattr("app.channels.buzz.STOP_TIMEOUT_SECONDS", 0.01)
+
+    async def run():
+        ch = _channel()
+        started = asyncio.Event()
+
+        async def wedged_run_loop():
+            ch._transport = FakeTransport()
+            started.set()
+            for _ in range(20):  # bounded (~0.2s) so the test can never wedge the suite
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    pass  # deliberately swallow the cancel stop() sends
+
+        ch._run_loop = wedged_run_loop
+        await ch.start()
+        task = ch._task
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+            await asyncio.wait_for(ch.stop(), timeout=5)
+
+        assert ch._task is None and ch._transport is None
+        await asyncio.wait_for(task, timeout=5)  # let the abandoned loop retire cleanly
+
+    asyncio.run(run())
+    assert "did not finish" in caplog.text
+
+
+def test_stop_clears_per_connection_state_so_a_restart_cannot_edit_stale_placeholders():
+    async def run():
+        ch = _channel()
+        ch._spawn_connection = lambda: None
+        await ch.start()
+        ch._stream_targets[(CHANNEL, None)] = "aa" * 32
+        ch._stream_tails[(CHANNEL, None)] = ["bb" * 32]
+        ch._last_requester[(CHANNEL, None)] = OWNER
+        ch._channel_meta[CHANNEL] = {"type": "dm", "name": "x"}
+        ch._pending_auth_challenge = "challenge"
+
+        await ch.stop()
+
+        assert not ch._stream_targets and not ch._stream_tails and not ch._last_requester
+        assert not ch._channel_meta and ch._pending_auth_challenge is None
+
+    asyncio.run(run())
+
+
+def test_channel_metadata_cache_is_bounded_against_remote_feeding():
+    """Any relay member can publish kind-39000 events, so the cache is remote-fed and
+    must not grow for the process lifetime one forged `d` tag at a time."""
+    ch, _ = _started()
+    for i in range(MAX_CACHED_CHANNELS + 25):
+        ch._handle_meta_event({"kind": 39000, "tags": [["d", f"chan-{i}"], ["t", "stream"]]})
+    assert len(ch._channel_meta) == MAX_CACHED_CHANNELS
+    assert "chan-0" not in ch._channel_meta  # oldest evicted first
+    assert f"chan-{MAX_CACHED_CHANNELS + 24}" in ch._channel_meta

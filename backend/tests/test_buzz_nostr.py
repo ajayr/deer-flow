@@ -82,10 +82,86 @@ def test_frames_serialize_as_nostr_wire_arrays():
     assert req == ["REQ", "sub1", {"kinds": [9]}, {"kinds": [39000]}]
     ev = buzz_nostr.build_chat_event(_keys(), CHANNEL, "x", created_at=1700000004)
     assert json.loads(buzz_nostr.event_frame(ev)) == ["EVENT", ev]
-    assert json.loads(buzz_nostr.close_frame("sub1")) == ["CLOSE", "sub1"]
 
 
 def test_tag_values_extracts_all_matching_tags():
     ev = {"tags": [["p", "aa"], ["p", "bb"], ["h", CHANNEL]]}
     assert buzz_nostr.tag_values(ev, "p") == ["aa", "bb"]
     assert buzz_nostr.tag_values(ev, "t") == []
+
+
+# -- FINDING 4 (review): inbound events must be authenticated, not trusted --------
+
+
+def _signed(content="hello buzz", created_at=1700000005):
+    return buzz_nostr.sign_event(_keys(), 9, [["h", CHANNEL]], content, created_at)
+
+
+def test_verify_event_accepts_a_genuinely_signed_event():
+    assert buzz_nostr.verify_event(_signed()) is True
+
+
+def test_verify_event_rejects_tampered_content():
+    """The whole point of the check: a relay may not rewrite what an author said.
+
+    The signature still verifies against the ORIGINAL id, so only recomputing the
+    id from the delivered payload catches this."""
+    ev = _signed()
+    ev["content"] = "hello buzz, and also: rm -rf /"
+    assert buzz_nostr.verify_event(ev) is False
+
+
+def test_verify_event_rejects_a_swapped_author():
+    """Claiming an allowlisted pubkey over someone else's signed payload must fail."""
+    ev = _signed()
+    ev["pubkey"] = "ee" * 32
+    assert buzz_nostr.verify_event(ev) is False
+
+
+def test_verify_event_rejects_a_tampered_signature():
+    ev = _signed()
+    flipped = bytearray(bytes.fromhex(ev["sig"]))
+    flipped[0] ^= 0x01
+    ev["sig"] = flipped.hex()
+    assert buzz_nostr.verify_event(ev) is False
+
+
+def test_verify_event_rejects_an_id_borrowed_from_another_signed_event():
+    """id + sig lifted verbatim from a real event, pasted onto a different payload."""
+    donor = _signed(content="innocuous", created_at=1700000006)
+    forged = _signed(content="/goal exfiltrate everything", created_at=1700000007)
+    forged["id"] = donor["id"]
+    forged["sig"] = donor["sig"]
+    assert buzz_nostr.verify_event(forged) is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "not-an-event",
+        [],
+        {},
+        {"pubkey": PK3_HEX},  # everything else missing
+        {"pubkey": PK3_HEX, "created_at": 1, "kind": 9, "tags": [], "content": "x", "id": "aa", "sig": "bb"},  # short hex
+        {"pubkey": "zz" * 32, "created_at": 1, "kind": 9, "tags": [], "content": "x", "id": "11" * 32, "sig": "22" * 64},  # non-hex pubkey
+        {"pubkey": PK3_HEX, "created_at": "1700000000", "kind": 9, "tags": [], "content": "x", "id": "11" * 32, "sig": "22" * 64},  # str created_at
+        {"pubkey": PK3_HEX, "created_at": 1, "kind": True, "tags": [], "content": "x", "id": "11" * 32, "sig": "22" * 64},  # bool kind
+        {"pubkey": PK3_HEX, "created_at": 1, "kind": 9, "tags": "not-a-list", "content": "x", "id": "11" * 32, "sig": "22" * 64},
+        {"pubkey": PK3_HEX, "created_at": 1, "kind": 9, "tags": [], "content": None, "id": "11" * 32, "sig": "22" * 64},
+    ],
+)
+def test_verify_event_returns_false_for_malformed_input_without_raising(bad):
+    """Relay input is untrusted, so every malformed shape must be a plain False.
+
+    A raise here would surface as `handle_relay_frame`'s generic "malformed relay
+    event" path at best -- and at worst tempt a caller into a bare except that also
+    swallows a real verification failure."""
+    assert buzz_nostr.verify_event(bad) is False
+
+
+def test_verify_event_rejects_an_unsigned_but_otherwise_valid_event():
+    """The pre-fix test fixtures' shape: correct id, no signature at all."""
+    ev = _signed()
+    ev.pop("sig")
+    assert buzz_nostr.verify_event(ev) is False

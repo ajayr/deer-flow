@@ -428,6 +428,7 @@ DeerFlow can also expose user-owned IM channel connections in the workspace UI. 
 | WeChat | Tencent iLink (long-polling) | Moderate |
 | WeCom | WebSocket | Moderate |
 | DingTalk | Stream Push (WebSocket) | Moderate |
+| Buzz | Nostr relay (WebSocket, NIP-42) | Moderate |
 
 **Configuration in `config.yaml`:**
 

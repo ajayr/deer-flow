@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Any
 
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
@@ -125,16 +126,57 @@ def build_edit_event(keys: NostrKeys, channel_id: str, target_event_id: str, con
     return sign_event(keys, KIND_EDIT, [["h", channel_id], ["e", target_event_id]], content, created_at)
 
 
+def verify_event(event: Any) -> bool:
+    """True only when *event* carries a self-consistent id and a valid BIP-340 signature.
+
+    Two independent checks, both required:
+
+    1. The NIP-01 event id is RECOMPUTED from the event's own
+       ``pubkey``/``created_at``/``kind``/``tags``/``content`` and must equal the
+       ``id`` the sender claims -- so ``id`` cannot be borrowed from a different
+       (legitimately signed) event while the payload is swapped.
+    2. The Schnorr signature must verify against that id under the claimed
+       ``pubkey``, which is what actually binds the payload to its author.
+
+    Relay input is untrusted, so this NEVER raises: any missing, mistyped,
+    non-hex, or wrong-length field -- or a payload that is not even a mapping --
+    is simply an event that fails to verify, and callers must be able to treat
+    "malformed" and "forged" identically without a try/except at every call site.
+    A missing ``coincurve`` (the optional ``buzz`` extra) also lands here and
+    fails closed; it is unreachable in practice because ``BuzzChannel.start()``
+    already parses its private key through ``coincurve`` and would have failed
+    with :data:`COINCURVE_INSTALL_HINT` long before any event arrived.
+    """
+    try:
+        if not isinstance(event, dict):
+            return False
+        pubkey = event.get("pubkey")
+        sig = event.get("sig")
+        claimed_id = event.get("id")
+        content = event.get("content")
+        created_at = event.get("created_at")
+        kind = event.get("kind")
+        tags = event.get("tags")
+        # bool is an int subclass; a JSON `true` in either numeric field would
+        # otherwise serialize as "true" and silently change the canonical form.
+        if not isinstance(pubkey, str) or not isinstance(sig, str) or not isinstance(claimed_id, str) or not isinstance(content, str) or not isinstance(tags, list):
+            return False
+        if not isinstance(created_at, int) or isinstance(created_at, bool) or not isinstance(kind, int) or isinstance(kind, bool):
+            return False
+        if event_id(pubkey, created_at, kind, tags, content) != claimed_id:
+            return False
+        coincurve = _require_coincurve()
+        return bool(coincurve.PublicKeyXOnly(bytes.fromhex(pubkey)).verify(bytes.fromhex(sig), bytes.fromhex(claimed_id)))
+    except Exception:
+        return False
+
+
 def req_frame(sub_id: str, *filters: dict) -> str:
     return json.dumps(["REQ", sub_id, *filters], separators=(",", ":"))
 
 
 def event_frame(event: dict) -> str:
     return json.dumps(["EVENT", event], separators=(",", ":"))
-
-
-def close_frame(sub_id: str) -> str:
-    return json.dumps(["CLOSE", sub_id], separators=(",", ":"))
 
 
 def tag_values(event: dict, name: str) -> list[str]:
