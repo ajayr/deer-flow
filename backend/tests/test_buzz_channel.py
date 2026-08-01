@@ -419,6 +419,78 @@ def test_edit_failure_degrades_to_fresh_post_and_retargets_stream(monkeypatch):
     assert ch._stream_targets[(CHANNEL, None)] == events[1]["id"]  # retargeted to the new message
 
 
+# -- Review finding: _stream_targets must not leak when a FINAL send() raises -----
+
+
+def test_stream_target_cleared_even_when_final_send_fails(monkeypatch):
+    """FINDING (Important/spec): the edit->degrade path can raise (both the edit
+    AND the degraded fresh-post attempts exhaust their retries), which used to
+    propagate out of send() BEFORE reaching the `if msg.is_final: pop` at the end
+    -- leaking a stale _stream_targets entry. This must hold regardless of
+    success/failure: (a) send() must still raise (the framework's retry/error
+    path in Channel._on_outbound must still see the failure), and (b) the stale
+    target must not survive, so the NEXT send() for this conversation starts a
+    fresh placeholder (kind 9) rather than editing the abandoned one (kind
+    40003) once the relay recovers."""
+    monkeypatch.setattr("app.channels.base.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+
+    class AlwaysFailingTransport:
+        async def send(self, text):
+            raise RuntimeError("relay down")
+
+    ch._transport = AlwaysFailingTransport()
+
+    # Seed an existing placeholder target, as a prior successful non-final
+    # send() would have, so this final call takes the edit (not "first post")
+    # branch -- the exact branch the finding calls out.
+    key = (CHANNEL, None)
+    ch._stream_targets[key] = "ff" * 32
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(ch.send(_outbound(ch, "final answer", is_final=True)))
+
+    assert key not in ch._stream_targets  # no stale/partial target survives a raised final send
+
+    # Once the relay recovers, the next send() for the same conversation must
+    # start a fresh placeholder, not an edit targeting the abandoned message.
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.send(_outbound(ch, "retry after recovery", is_final=True)))
+    (ev,) = _events_of(transport)
+    assert ev["kind"] == 9
+
+
+def test_stream_target_cleared_when_overflow_chunk_send_fails(monkeypatch):
+    """Second FINDING regression case, pinning the other raise site named in the
+    review: the overflow-chunk loop can also raise (a later chunk fails after
+    retries even though the first chunk already succeeded). _stream_targets must
+    still be cleared for this key -- not left pointing at the successfully-sent
+    first chunk -- and the exception must still propagate."""
+    monkeypatch.setattr("app.channels.base.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+
+    class FailsAfterFirstFrame:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, text):
+            frame = json.loads(text)
+            if self.sent:  # the first frame succeeds; every one after raises
+                raise RuntimeError("relay dropped mid-stream")
+            self.sent.append(frame)
+
+    transport = FailsAfterFirstFrame()
+    ch._transport = transport
+    key = (CHANNEL, None)
+    big = "x" * 130_000  # forces at least one follow-up overflow chunk
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(ch.send(_outbound(ch, big, is_final=True)))
+
+    assert key not in ch._stream_targets
+
+
 # -- Task 4 carry-forward: /connect must reply, and a failed reply send must ------
 # -- never be reported as a failed bind -------------------------------------------
 

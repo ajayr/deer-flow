@@ -363,7 +363,10 @@ class BuzzChannel(Channel):
         ``RuntimeError`` when ``_transport`` is ``None``) after retries are
         exhausted, so the framework's outer retry/error-logging path in
         ``Channel._on_outbound`` observes the failure instead of a reply being
-        silently dropped.
+        silently dropped. The ``is_final`` bookkeeping below runs in a
+        ``finally`` block precisely so that a raised exception still propagates
+        to the caller *and* still clears the stale target — see the ``finally``
+        comment for why both matter.
         """
         assert self._keys is not None
         key = (msg.chat_id, msg.thread_ts)
@@ -371,28 +374,42 @@ class BuzzChannel(Channel):
         chunks = _chunk_text(msg.text)
         target = self._stream_targets.get(key)
 
-        if target is None:
-            requester = self._last_requester.get(key)
-            mentions = (requester,) if requester else ()
-            first = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts, mentions=mentions)
-            await self._send_with_retry(lambda: self._post_event(first), max_retries=3, operation_name="post")
-            self._stream_targets[key] = first["id"]
-        else:
-            edit = buzz_nostr.build_edit_event(self._keys, msg.chat_id, target, chunks[0], created_at=now)
-            try:
-                await self._send_with_retry(lambda: self._post_event(edit), max_retries=3, operation_name="edit")
-            except Exception:
-                # Degrade: never lose content — post a fresh message instead of the
-                # edit, and retarget subsequent edits at it. No mention here: the
-                # requester was already mentioned on the original placeholder, and
-                # re-mentioning on every degraded edit would spam notifications.
-                fresh = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts)
-                await self._send_with_retry(lambda: self._post_event(fresh), max_retries=3, operation_name="post-degraded")
-                self._stream_targets[key] = fresh["id"]
+        try:
+            if target is None:
+                requester = self._last_requester.get(key)
+                mentions = (requester,) if requester else ()
+                first = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts, mentions=mentions)
+                await self._send_with_retry(lambda: self._post_event(first), max_retries=3, operation_name="post")
+                self._stream_targets[key] = first["id"]
+            else:
+                edit = buzz_nostr.build_edit_event(self._keys, msg.chat_id, target, chunks[0], created_at=now)
+                try:
+                    await self._send_with_retry(lambda: self._post_event(edit), max_retries=3, operation_name="edit")
+                except Exception:
+                    # Degrade: never lose content — post a fresh message instead of the
+                    # edit, and retarget subsequent edits at it. No mention here: the
+                    # requester was already mentioned on the original placeholder, and
+                    # re-mentioning on every degraded edit would spam notifications.
+                    fresh = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts)
+                    await self._send_with_retry(lambda: self._post_event(fresh), max_retries=3, operation_name="post-degraded")
+                    self._stream_targets[key] = fresh["id"]
 
-        for extra in chunks[1:]:
-            follow = buzz_nostr.build_chat_event(self._keys, msg.chat_id, extra, created_at=now, reply_to=msg.thread_ts)
-            await self._send_with_retry(lambda ev=follow: self._post_event(ev), max_retries=3, operation_name="post-overflow")
-
-        if msg.is_final:
-            self._stream_targets.pop(key, None)
+            for extra in chunks[1:]:
+                follow = buzz_nostr.build_chat_event(self._keys, msg.chat_id, extra, created_at=now, reply_to=msg.thread_ts)
+                await self._send_with_retry(lambda ev=follow: self._post_event(ev), max_retries=3, operation_name="post-overflow")
+        finally:
+            # Reviewer finding: the degrade-to-fresh-post branch above and the
+            # overflow-chunk loop can both raise after their own retries are
+            # exhausted, which used to propagate out of send() *before* reaching
+            # an unconditional pop at the end of the function -- leaking a stale
+            # (or half-updated) _stream_targets[key] entry whenever the failing
+            # call had is_final=True. Once the relay recovered, the next send()
+            # for this conversation would then EDIT that abandoned placeholder
+            # instead of starting a fresh message, contradicting this method's
+            # own contract. A `finally` clears the bookkeeping on every path --
+            # success or failure -- while still letting the exception propagate
+            # (a `finally` block never suppresses an in-flight exception unless
+            # it itself returns/raises), so `Channel._on_outbound` still logs
+            # the failure exactly as before.
+            if msg.is_final:
+                self._stream_targets.pop(key, None)
