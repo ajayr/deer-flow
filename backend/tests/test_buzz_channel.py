@@ -209,3 +209,90 @@ def test_auth_frame_records_challenge_and_meta_defaults_fail_closed():
     # unknown channel type == not a DM -> unmentioned message still dropped
     _dispatch(ch, _event(channel="99999999-9999-4999-8999-999999999999", content="x", mentions=()))
     assert captured == []
+
+
+# -- Task 4 review fixes -----------------------------------------------------
+
+
+class FakeConnectionRepo:
+    """Minimal test double for ChannelConnectionRepository: consume + upsert only."""
+
+    def __init__(self, *, states=None, raise_on_consume=False):
+        self._states = dict(states or {})
+        self._raise_on_consume = raise_on_consume
+        self.upserts = []
+
+    async def consume_oauth_state(self, *, provider, state, now=None):
+        if self._raise_on_consume:
+            raise RuntimeError("boom")
+        owner_user_id = self._states.pop(state, None)
+        if owner_user_id is None:
+            return None
+        return {"owner_user_id": owner_user_id, "provider": provider, "requested_scopes": [], "metadata": {}, "redirect_after": None}
+
+    async def upsert_connection(self, **kwargs):
+        self.upserts.append(kwargs)
+        return {"id": "conn-1", **kwargs}
+
+
+def test_connect_code_binds_and_never_publishes_even_for_unauthorized_author():
+    """FINDING 1 (Critical): a valid /connect code from a non-allowlisted pubkey
+    must bind via the connection repo and never reach _publish as a chat message."""
+    repo = FakeConnectionRepo(states={"tok-1": "owner-xyz"})
+    ch, captured = _started(connection_repo=repo)
+    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect tok-1", mentions=()))
+    assert captured == []
+    assert len(repo.upserts) == 1
+    assert repo.upserts[0]["owner_user_id"] == "owner-xyz"
+    assert repo.upserts[0]["external_account_id"] == "ee" * 32
+    assert repo.upserts[0]["provider"] == "buzz"
+
+
+def test_connect_code_invalid_never_publishes_and_does_not_bind():
+    """An unrecognized/expired code must still never publish, and must not upsert."""
+    repo = FakeConnectionRepo()
+    ch, captured = _started(connection_repo=repo)
+    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect not-a-real-code", mentions=()))
+    assert captured == []
+    assert repo.upserts == []
+
+
+def test_connect_code_repo_error_never_publishes_and_does_not_crash():
+    """A connection-repo failure while binding must be swallowed, not crash the read loop,
+    and must still never fall through to publish."""
+    repo = FakeConnectionRepo(raise_on_consume=True)
+    ch, captured = _started(connection_repo=repo)
+    _dispatch(ch, _event(pubkey="ee" * 32, content="/connect tok-1", mentions=()))
+    assert captured == []
+
+
+def test_connect_code_never_publishes_even_for_already_allowed_and_mentioned_author():
+    """Ruling: a /connect message must NEVER reach _publish, valid code or not --
+    even when the author is already allowlisted and mentioned."""
+    repo = FakeConnectionRepo(states={"tok-2": "owner-abc"})
+    ch, captured = _started(connection_repo=repo)
+    _dispatch(ch, _event(pubkey=OWNER, content="/connect tok-2", mentions=(PK3_HEX,)))
+    assert captured == []
+    assert len(repo.upserts) == 1 and repo.upserts[0]["external_account_id"] == OWNER
+
+
+def test_known_command_classifies_as_command_but_plain_text_stays_chat():
+    """FINDING 3: is_known_channel_command classification had no direct coverage."""
+    ch, captured = _started()
+    _dispatch(ch, _event(content="@DeerFlow /goal ship it", mentions=(PK3_HEX,), eid="44" * 32))
+    assert len(captured) == 1
+    assert captured[0].msg_type == InboundMessageType.COMMAND
+    assert captured[0].text == "/goal ship it"
+
+    _dispatch(ch, _event(content="@DeerFlow just chatting", mentions=(PK3_HEX,), eid="55" * 32))
+    assert len(captured) == 2
+    assert captured[1].msg_type == InboundMessageType.CHAT
+
+
+def test_strip_own_mention_leaves_ambiguous_multi_mention_text_untouched():
+    """FINDING 4: "@Alice, @DeerFlow help" must not have Alice's mention dropped
+    just because our own mention also appears in the message."""
+    ch, captured = _started()
+    _dispatch(ch, _event(content="@Alice, @DeerFlow help", mentions=(PK3_HEX,)))
+    assert len(captured) == 1
+    assert captured[0].text == "@Alice, @DeerFlow help"

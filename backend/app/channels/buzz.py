@@ -117,7 +117,21 @@ class BuzzChannel(Channel):
         # OK / EOSE / NOTICE frames need no action
 
     def _handle_meta_event(self, ev: dict) -> None:
-        """Cache kind-39000 channel metadata: ``d`` = channel id, ``t`` = type, ``name``."""
+        """Cache kind-39000 channel metadata: ``d`` = channel id, ``t`` = type, ``name``.
+
+        Trust assumption (not currently verified): this does not check
+        ``ev.get("pubkey")``. In the Buzz protocol, kind-39000 channel-discovery
+        events are expected to be published by the relay's own keypair, not by
+        ordinary members. As implemented, any relay member able to publish an
+        event can forge one and mark an arbitrary channel ``type: "dm"``, which
+        relaxes the mention gate for that channel (see ``_is_dm``) — it does NOT
+        bypass the independent pubkey allowlist gate in ``_handle_chat_event``.
+        Closing this gap needs a trusted relay pubkey to check the author
+        against, and nothing already configured identifies one: ``relay_url`` is
+        a network address, not a signing key. Deliberately left as a follow-up
+        rather than inventing a new required config key (e.g. ``relay_pubkey``)
+        for it here.
+        """
         d_values = buzz_nostr.tag_values(ev, "d")
         if not d_values:
             return
@@ -139,11 +153,61 @@ class BuzzChannel(Channel):
         return e_tags[0] if e_tags else None
 
     def _strip_own_mention(self, text: str) -> str:
+        """Strip a single, unambiguous leading ``@mention`` token.
+
+        Nostr chat events carry no verified mapping from the free-text "@Name" a
+        client rendered into the message body to the pubkeys in the event's ``p``
+        tags — the caller only confirms *some* p-tagged mention exists (see
+        ``mentioned`` in ``_handle_chat_event``), never that the specific leading
+        token names *us*. When a second ``@token`` immediately follows the first
+        (e.g. "@Alice, @DeerFlow help"), guessing that the first one is ours risks
+        silently discarding a different member's mention while leaving ours
+        untouched, so the conservative choice is to leave the text completely
+        alone rather than guess. The common single-mention case ("@DeerFlow
+        hello") remains unambiguous and is still stripped.
+        """
         stripped = text.lstrip()
-        if stripped.startswith("@"):
-            head, _, rest = stripped.partition(" ")
-            return rest.strip() or stripped
-        return text.strip()
+        if not stripped.startswith("@"):
+            return text.strip()
+        _, sep, rest = stripped.partition(" ")
+        if not sep:
+            return stripped  # "@DeerFlow" alone: nothing to strip without losing the whole message
+        if rest.lstrip().startswith("@"):
+            return text.strip()  # ambiguous multi-mention prefix: don't guess which one is ours
+        return rest.strip() or stripped
+
+    async def _bind_connection(self, code: str, author: str) -> None:
+        """Consume a ``/connect <code>`` bind code for *author* (a Nostr pubkey hex).
+
+        Always fully handles the request — valid code, invalid/expired/already-used
+        code, or a connection-repo error — so the caller (``_handle_chat_event``) can
+        unconditionally return right after awaiting this without ever falling through
+        to ``_make_inbound``/``_publish``. Mirrors discord.py's
+        ``_bind_connection_from_connect_code``, except Buzz has no outbound path yet
+        (Task 5/6), so there is no confirmation reply sent back over the relay;
+        success/failure is only logged.
+        """
+        if self._connection_repo is None:
+            return  # unreachable in practice: _pending_connect_code already requires this
+        try:
+            state = await self._connection_repo.consume_oauth_state(provider="buzz", state=code)
+            if state is None:
+                logger.info("[buzz] /connect code invalid, expired, or already used (pubkey=%s)", author)
+                return
+            await self._connection_repo.upsert_connection(
+                owner_user_id=state["owner_user_id"],
+                provider="buzz",
+                external_account_id=author,
+                workspace_id=urlparse(self._relay_url).netloc,
+                metadata={"pubkey": author},
+                status="connected",
+            )
+            logger.info("[buzz] connected pubkey=%s to owner_user_id=%s", author, state["owner_user_id"])
+        except Exception:
+            # A repo/DB error binding the code must not propagate: handle_relay_frame's
+            # outer guard would also catch it, but catching here keeps the log specific
+            # to the bind failure instead of a generic "malformed relay event ignored".
+            logger.exception("[buzz] failed to bind /connect code for pubkey=%s", author)
 
     async def _handle_chat_event(self, ev: dict) -> None:
         assert self._keys is not None
@@ -159,16 +223,31 @@ class BuzzChannel(Channel):
         # /connect <code> must be consulted before the allowlist gate (framework
         # ordering rule — see Channel._pending_connect_code) so a not-yet-bound
         # user can bootstrap a binding even though they aren't allowlisted yet.
+        # Unlike every other gate below, a /connect message is never published:
+        # _bind_connection fully handles it (valid, invalid, or erroring code)
+        # and this always returns immediately after, matching every sibling
+        # adapter's _bind_connection_from_connect_code (discord.py, slack.py,
+        # wecom.py, dingtalk.py, wechat.py, feishu.py). Falling through to the
+        # mention/allowlist gates and publishing this as an ordinary chat message
+        # would let any pubkey trigger a real agent run just by prefixing a
+        # message with "/connect" — Buzz's run policy sets
+        # requires_bound_identity=False, so the manager has no independent
+        # bound-identity check to catch that.
         code = self._pending_connect_code(text)
-        if code is None and author not in self._allowed_users:
+        if code is not None:
+            await self._bind_connection(code, author)
+            return
+        if author not in self._allowed_users:
             return
 
+        # code is always None here: a non-None code was already fully handled
+        # and returned above, so this gate only ever sees ordinary chat text.
         thread_root = self._thread_root(ev)
         mentioned = self._keys.pubkey_hex in buzz_nostr.tag_values(ev, "p")
         store = self.config.get("channel_store")
         engaged_thread = bool(thread_root and store is not None and store.get_thread_id(self.name, channel_id, topic_id=thread_root))
         allowed_without_mention = (not self._require_mention) or channel_id in self._mention_free or self._is_dm(channel_id) or engaged_thread
-        if code is None and not mentioned and not allowed_without_mention:
+        if not mentioned and not allowed_without_mention:
             return
 
         if mentioned:
