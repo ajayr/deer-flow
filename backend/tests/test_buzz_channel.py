@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -416,3 +417,60 @@ def test_edit_failure_degrades_to_fresh_post_and_retargets_stream(monkeypatch):
     assert [e["kind"] for e in events] == [9, 9]  # placeholder + degraded fresh post, no successful edit
     assert events[1]["content"] == "update that fails to edit"
     assert ch._stream_targets[(CHANNEL, None)] == events[1]["id"]  # retargeted to the new message
+
+
+# -- Task 4 carry-forward: /connect must reply, and a failed reply send must ------
+# -- never be reported as a failed bind -------------------------------------------
+
+
+def test_connect_success_sends_confirmation_reply():
+    repo = FakeConnectionRepo(states={"tok-conf": "owner-conf"})
+    ch, captured = _started(connection_repo=repo)
+    transport = FakeTransport()
+    ch._transport = transport
+    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-conf", mentions=()))
+    events = _events_of(transport)
+    assert len(events) == 1
+    assert events[0]["kind"] == 9
+    assert events[0]["content"] == "Buzz connected to DeerFlow."
+    assert ["p", "ff" * 32] in events[0]["tags"]
+    assert captured == []  # still never published as a chat message
+
+
+def test_connect_invalid_code_sends_error_reply():
+    repo = FakeConnectionRepo()
+    ch, captured = _started(connection_repo=repo)
+    transport = FakeTransport()
+    ch._transport = transport
+    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect not-a-real-code", mentions=()))
+    (event,) = _events_of(transport)
+    assert event["content"] == "Buzz connection code is invalid or expired."
+
+
+def test_connect_repo_error_sends_error_reply_and_does_not_crash():
+    repo = FakeConnectionRepo(raise_on_consume=True)
+    ch, captured = _started(connection_repo=repo)
+    transport = FakeTransport()
+    ch._transport = transport
+    _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-1", mentions=()))
+    (event,) = _events_of(transport)
+    assert event["content"] == "Buzz connection could not be completed from this message."
+
+
+def test_connect_success_survives_a_failed_confirmation_send(caplog):
+    """CRITICAL (Task 4 review carry-forward pitfall): a failure to SEND the
+    confirmation for an otherwise-successful bind must never be reported or
+    logged as a bind failure. ch._transport is left unset (None) so the reply
+    attempt raises, but the bind itself (consume_oauth_state + upsert_connection)
+    must still go through, and only a distinctly-worded send-failure warning may
+    be logged -- never "failed to bind"."""
+    repo = FakeConnectionRepo(states={"tok-fail-send": "owner-fail-send"})
+    ch, captured = _started(connection_repo=repo)
+    with caplog.at_level(logging.INFO, logger="app.channels.buzz"):
+        _dispatch(ch, _event(pubkey="ff" * 32, content="/connect tok-fail-send", mentions=()))
+
+    assert len(repo.upserts) == 1  # the bind itself succeeded despite the failed reply
+    assert repo.upserts[0]["owner_user_id"] == "owner-fail-send"
+    assert captured == []
+    assert "failed to bind" not in caplog.text
+    assert "failed to send" in caplog.text

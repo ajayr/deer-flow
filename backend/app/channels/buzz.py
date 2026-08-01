@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 # Headroom under the relay's 64KB edit-content cap (kind-40003 events).
 EDIT_MAX_BYTES = 60_000
 
+# Wording mirrors every sibling adapter's `/connect` reply style (discord.py's
+# `_send_connection_reply`, slack.py's `_post_connection_reply`, and the same
+# templates in wecom.py / feishu.py / dingtalk.py / wechat.py), substituting
+# "Buzz" for the platform name.
+_CONNECT_REPLY_TEXT = {
+    "success": "Buzz connected to DeerFlow.",
+    "invalid": "Buzz connection code is invalid or expired.",
+    "error": "Buzz connection could not be completed from this message.",
+}
+
 
 def _chunk_text(text: str, limit: int = EDIT_MAX_BYTES) -> list[str]:
     """Split *text* into chunks whose UTF-8 ENCODED byte length never exceeds *limit*.
@@ -203,16 +213,22 @@ class BuzzChannel(Channel):
             return text.strip()  # ambiguous multi-mention prefix: don't guess which one is ours
         return rest.strip() or stripped
 
-    async def _bind_connection(self, code: str, author: str) -> None:
+    async def _bind_connection(self, code: str, author: str, channel_id: str) -> None:
         """Consume a ``/connect <code>`` bind code for *author* (a Nostr pubkey hex).
 
         Always fully handles the request — valid code, invalid/expired/already-used
         code, or a connection-repo error — so the caller (``_handle_chat_event``) can
         unconditionally return right after awaiting this without ever falling through
-        to ``_make_inbound``/``_publish``. Mirrors discord.py's
-        ``_bind_connection_from_connect_code``, except Buzz has no outbound path yet
-        (Task 5/6), so there is no confirmation reply sent back over the relay;
-        success/failure is only logged.
+        to ``_make_inbound``/``_publish``. Mirrors discord.py's / slack.py's
+        ``_bind_connection_from_connect_code``.
+
+        Bind success/failure is fully determined and logged by the try/except below
+        BEFORE ``_reply_to_connect`` is ever invoked, so a failure to *send* the
+        confirmation/error reply can never be attributed back to (or logged as) a
+        bind failure — see ``_reply_to_connect``. This ordering is deliberate: an
+        earlier review of this method flagged that sending from inside the same
+        try/except that decides bind success would let a relay-send hiccup on an
+        otherwise-successful bind get reported as "failed to bind".
         """
         if self._connection_repo is None:
             return  # unreachable in practice: _pending_connect_code already requires this
@@ -220,21 +236,48 @@ class BuzzChannel(Channel):
             state = await self._connection_repo.consume_oauth_state(provider="buzz", state=code)
             if state is None:
                 logger.info("[buzz] /connect code invalid, expired, or already used (pubkey=%s)", author)
-                return
-            await self._connection_repo.upsert_connection(
-                owner_user_id=state["owner_user_id"],
-                provider="buzz",
-                external_account_id=author,
-                workspace_id=urlparse(self._relay_url).netloc,
-                metadata={"pubkey": author},
-                status="connected",
-            )
-            logger.info("[buzz] connected pubkey=%s to owner_user_id=%s", author, state["owner_user_id"])
+                outcome = "invalid"
+            else:
+                await self._connection_repo.upsert_connection(
+                    owner_user_id=state["owner_user_id"],
+                    provider="buzz",
+                    external_account_id=author,
+                    workspace_id=urlparse(self._relay_url).netloc,
+                    metadata={"pubkey": author},
+                    status="connected",
+                )
+                logger.info("[buzz] connected pubkey=%s to owner_user_id=%s", author, state["owner_user_id"])
+                outcome = "success"
         except Exception:
             # A repo/DB error binding the code must not propagate: handle_relay_frame's
             # outer guard would also catch it, but catching here keeps the log specific
             # to the bind failure instead of a generic "malformed relay event ignored".
             logger.exception("[buzz] failed to bind /connect code for pubkey=%s", author)
+            outcome = "error"
+
+        # Bind success/failure is already fully decided and logged above; sending
+        # the reply is a separate, best-effort concern from here on.
+        await self._reply_to_connect(channel_id, author, _CONNECT_REPLY_TEXT[outcome])
+
+    async def _reply_to_connect(self, channel_id: str, author: str, text: str) -> None:
+        """Best-effort confirmation/error reply for a ``/connect`` attempt.
+
+        The caller (``_bind_connection``) has already fully decided and logged the
+        bind outcome before this runs. A failure here is a relay-send problem, not
+        a bind problem: mirroring discord.py's ``_send_connection_reply`` / slack.py's
+        ``_post_connection_reply``, it never raises and logs its own,
+        distinctly-worded warning, so it can never be mistaken for (or logged as) a
+        failed bind. Uses a single attempt (no retry/backoff): this is a courtesy
+        notification, not the delivery-critical agent-response path ``send()``
+        serves, so a transient relay hiccup here should not add retry latency to
+        the inbound relay read loop.
+        """
+        assert self._keys is not None
+        try:
+            event = buzz_nostr.build_chat_event(self._keys, channel_id, text, created_at=int(time.time()), mentions=(author,))
+            await self._send_with_retry(lambda: self._post_event(event), max_retries=1, operation_name="connect-reply")
+        except Exception:
+            logger.warning("[buzz] failed to send /connect reply to pubkey=%s", author)
 
     async def _handle_chat_event(self, ev: dict) -> None:
         assert self._keys is not None
@@ -262,7 +305,7 @@ class BuzzChannel(Channel):
         # bound-identity check to catch that.
         code = self._pending_connect_code(text)
         if code is not None:
-            await self._bind_connection(code, author)
+            await self._bind_connection(code, author, channel_id)
             return
         if author not in self._allowed_users:
             return
