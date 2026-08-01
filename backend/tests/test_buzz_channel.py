@@ -1,15 +1,17 @@
 """Tests for the Buzz (Nostr) channel connector."""
 
 import asyncio
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
 pytest.importorskip("coincurve")
 
 from app.channels.base import Channel
-from app.channels.buzz import BuzzChannel
+from app.channels.buzz import BuzzChannel, _chunk_text
 from app.channels.manager import CHANNEL_CAPABILITIES
-from app.channels.message_bus import InboundMessageType, MessageBus
+from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage
 from app.channels.run_policy import CHANNEL_RUN_POLICY
 from app.channels.service import _CHANNEL_CREDENTIAL_KEYS, _CHANNEL_REGISTRY
 
@@ -296,3 +298,121 @@ def test_strip_own_mention_leaves_ambiguous_multi_mention_text_untouched():
     _dispatch(ch, _event(content="@Alice, @DeerFlow help", mentions=(PK3_HEX,)))
     assert len(captured) == 1
     assert captured[0].text == "@Alice, @DeerFlow help"
+
+
+# -- Task 5: outbound — placeholder post, streaming edits, final, oversize split ---
+
+
+class FakeTransport:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, text):
+        self.sent.append(json.loads(text))
+
+
+def _outbound(ch, text, *, is_final, thread_ts=None):
+    return OutboundMessage(channel_name="buzz", chat_id=CHANNEL, thread_id="t1", text=text, is_final=is_final, thread_ts=thread_ts)
+
+
+def _events_of(transport):
+    return [f[1] for f in transport.sent if f[0] == "EVENT"]
+
+
+def test_streaming_posts_placeholder_then_edits_then_final():
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    ch._last_requester[(CHANNEL, None)] = OWNER
+    asyncio.run(ch.send(_outbound(ch, "Working…", is_final=False)))
+    asyncio.run(ch.send(_outbound(ch, "Working… more", is_final=False)))
+    asyncio.run(ch.send(_outbound(ch, "Final answer", is_final=True)))
+    events = _events_of(transport)
+    assert [e["kind"] for e in events] == [9, 40003, 40003]
+    placeholder = events[0]
+    assert ["p", OWNER] in placeholder["tags"]  # requester notified on the initial post
+    assert all(["e", placeholder["id"]] in e["tags"] for e in events[1:])
+    assert events[-1]["content"] == "Final answer"
+    assert (CHANNEL, None) not in ch._stream_targets  # final clears the target
+
+
+def test_thread_reply_targets_thread_root():
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    root = "aa" * 32
+    asyncio.run(ch.send(_outbound(ch, "reply", is_final=True, thread_ts=root)))
+    (ev,) = _events_of(transport)
+    assert ev["kind"] == 9 and ["e", root] in ev["tags"]
+
+
+def test_oversized_final_splits_into_followup_posts():
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    big = "x" * 130_000  # > 2 * EDIT_MAX_BYTES
+    asyncio.run(ch.send(_outbound(ch, big, is_final=True)))
+    events = _events_of(transport)
+    assert events[0]["kind"] == 9 and all(e["kind"] == 9 for e in events[1:])
+    assert "".join(e["content"] for e in events) == big
+    assert all(len(e["content"].encode()) <= 60_000 for e in events)
+
+
+def test_send_without_transport_raises_for_retry(monkeypatch):
+    # Correction vs. the brief's literal snippet: _send_with_retry sleeps 2**attempt
+    # seconds between its 3 attempts on a real failure, which would otherwise burn
+    # ~3s of wall-clock time here for no benefit (this is a pure failure-path test).
+    # Patching the shared retry helper's sleep call keeps it instant without
+    # touching BuzzChannel/_send_with_retry itself.
+    monkeypatch.setattr("app.channels.base.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    with pytest.raises(RuntimeError):
+        asyncio.run(ch.send(_outbound(ch, "hi", is_final=True)))
+
+
+def test_chunk_text_never_splits_a_multibyte_character_across_chunks():
+    """Correctness requirement beyond the brief's (ASCII-only) oversize test:
+    splitting is by ENCODED BYTE LENGTH and must never cut a multi-byte UTF-8
+    character in half. Uses a 4-byte-wide character (an emoji outside the BMP)
+    with a limit that is deliberately NOT a multiple of 4, so a naive
+    text.encode()[:limit]-style byte slice would corrupt a character; the
+    real chunker must not."""
+    text = "\U0001f600" * 50  # grinning-face emoji: 4 bytes each in UTF-8
+    limit = 61
+    chunks = _chunk_text(text, limit=limit)
+    assert "".join(chunks) == text
+    assert all(len(c.encode()) <= limit for c in chunks)
+    # A split-mid-character chunk could never have a byte length that is an
+    # exact multiple of the (uniform) 4-byte character width.
+    assert all(len(c.encode()) % 4 == 0 for c in chunks)
+    assert chunks[0] == "\U0001f600" * 15  # 15*4=60 <= 61 bytes; a 16th char would make 64 > 61
+
+
+def test_edit_failure_degrades_to_fresh_post_and_retargets_stream(monkeypatch):
+    """Correctness requirement beyond the brief's literal tests: if an edit fails
+    after retries, BuzzChannel must degrade by posting a fresh message rather than
+    losing the content, and must retarget _stream_targets at the new message so
+    later edits in the same conversation land on it instead of the abandoned one."""
+    monkeypatch.setattr("app.channels.base.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+
+    class FailingEditTransport:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, text):
+            frame = json.loads(text)
+            if frame[0] == "EVENT" and frame[1]["kind"] == 40003:
+                raise RuntimeError("relay rejected edit")
+            self.sent.append(frame)
+
+    transport = FailingEditTransport()
+    ch._transport = transport
+
+    asyncio.run(ch.send(_outbound(ch, "placeholder", is_final=False)))
+    asyncio.run(ch.send(_outbound(ch, "update that fails to edit", is_final=False)))
+
+    events = [f[1] for f in transport.sent if f[0] == "EVENT"]
+    assert [e["kind"] for e in events] == [9, 9]  # placeholder + degraded fresh post, no successful edit
+    assert events[1]["content"] == "update that fails to edit"
+    assert ch._stream_targets[(CHANNEL, None)] == events[1]["id"]  # retargeted to the new message

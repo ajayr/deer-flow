@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -19,6 +20,32 @@ from app.channels.commands import is_known_channel_command
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage
 
 logger = logging.getLogger(__name__)
+
+# Headroom under the relay's 64KB edit-content cap (kind-40003 events).
+EDIT_MAX_BYTES = 60_000
+
+
+def _chunk_text(text: str, limit: int = EDIT_MAX_BYTES) -> list[str]:
+    """Split *text* into chunks whose UTF-8 ENCODED byte length never exceeds *limit*.
+
+    Operates character-by-character (not on raw encoded bytes), so a multi-byte
+    UTF-8 character is always appended to a chunk whole -- it is measured before
+    being added and, if it would push the running byte total over *limit*, the
+    chunk is flushed first and the character starts the next one. This makes a
+    split-mid-character corruption structurally impossible, regardless of
+    whether *limit* happens to be a multiple of any character's byte width.
+    """
+    chunks, current, size = [], [], 0
+    for ch in text:
+        b = len(ch.encode())
+        if size + b > limit and current:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(ch)
+        size += b
+    if current:
+        chunks.append("".join(current))
+    return chunks or [""]
 
 
 class BuzzChannel(Channel):
@@ -260,5 +287,69 @@ class BuzzChannel(Channel):
         self._last_requester[(channel_id, thread_root)] = author
         await self._publish(inbound)
 
-    async def send(self, msg: OutboundMessage) -> None:  # implemented in Task 5
-        raise NotImplementedError
+    # -- outbound --------------------------------------------------------------
+
+    async def _post_event(self, event: dict) -> None:
+        """Sign-and-post is already done by the caller; this only delivers the frame.
+
+        Reads ``self._transport`` at call time (never cached): Task 6's relay loop
+        sets it to a live WebSocket for the duration of a connection and back to
+        ``None`` on disconnect, so a stale reference here would keep "succeeding"
+        against a socket that is no longer attached to anything.
+        """
+        if self._transport is None:
+            raise RuntimeError("[buzz] relay connection not established")
+        await self._transport.send(buzz_nostr.event_frame(event))
+
+    async def send(self, msg: OutboundMessage) -> None:
+        """Post one placeholder chat message, then stream via in-place edits.
+
+        The first message for a given ``(chat_id, thread_ts)`` is a kind-9 chat
+        event (the only place a mention can ride, since kind-40003 edits carry
+        only ``h``/``e`` tags — see ``buzz_nostr.build_edit_event``). Every
+        subsequent update for the same key edits that placeholder in place via a
+        kind-40003 event targeting its id. ``is_final`` clears the tracked target
+        so the next run in this conversation starts a fresh placeholder instead of
+        editing a stale, already-answered message.
+
+        Oversize text is split by ``_chunk_text`` into <= ``EDIT_MAX_BYTES``-byte
+        chunks: the first chunk rides the placeholder/edit, any remaining chunks
+        are posted as follow-up kind-9 messages threaded to the same thread root.
+
+        Raises whatever the underlying send raised (including ``_post_event``'s
+        ``RuntimeError`` when ``_transport`` is ``None``) after retries are
+        exhausted, so the framework's outer retry/error-logging path in
+        ``Channel._on_outbound`` observes the failure instead of a reply being
+        silently dropped.
+        """
+        assert self._keys is not None
+        key = (msg.chat_id, msg.thread_ts)
+        now = int(time.time())
+        chunks = _chunk_text(msg.text)
+        target = self._stream_targets.get(key)
+
+        if target is None:
+            requester = self._last_requester.get(key)
+            mentions = (requester,) if requester else ()
+            first = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts, mentions=mentions)
+            await self._send_with_retry(lambda: self._post_event(first), max_retries=3, operation_name="post")
+            self._stream_targets[key] = first["id"]
+        else:
+            edit = buzz_nostr.build_edit_event(self._keys, msg.chat_id, target, chunks[0], created_at=now)
+            try:
+                await self._send_with_retry(lambda: self._post_event(edit), max_retries=3, operation_name="edit")
+            except Exception:
+                # Degrade: never lose content — post a fresh message instead of the
+                # edit, and retarget subsequent edits at it. No mention here: the
+                # requester was already mentioned on the original placeholder, and
+                # re-mentioning on every degraded edit would spam notifications.
+                fresh = buzz_nostr.build_chat_event(self._keys, msg.chat_id, chunks[0], created_at=now, reply_to=msg.thread_ts)
+                await self._send_with_retry(lambda: self._post_event(fresh), max_retries=3, operation_name="post-degraded")
+                self._stream_targets[key] = fresh["id"]
+
+        for extra in chunks[1:]:
+            follow = buzz_nostr.build_chat_event(self._keys, msg.chat_id, extra, created_at=now, reply_to=msg.thread_ts)
+            await self._send_with_retry(lambda ev=follow: self._post_event(ev), max_retries=3, operation_name="post-overflow")
+
+        if msg.is_final:
+            self._stream_targets.pop(key, None)
