@@ -69,3 +69,10 @@ backend/.coverage
 !README.md
 !frontend/README.md
 !backend/README.md
+
+# Runtime state, bind-mounted at runtime (DEER_FLOW_HOME) — must never enter the
+# build context: it holds the auth/JWT secret, per-user integration credentials,
+# threads and memory, and root-owned paths that break `docker build` for non-root
+# users.
+backend/.deer-flow/
+.deer-flow/
