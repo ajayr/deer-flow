@@ -136,6 +136,14 @@ STOP_TIMEOUT_SECONDS = 5.0
 #
 # AFTER the handshake the same reason means the relay stopped accepting our
 # authenticated session, which is a genuine outage and stays loud.
+#
+# "Completed its NIP-42 handshake" means the relay has ACKNOWLEDGED our AUTH
+# event (an ``OK ... true`` for it, or -- if the relay never sends one --
+# ``_confirm_auth_if_pending``'s fallback), never merely that we SENT it. A live
+# relay was observed still processing an AUTH we had already sent when it closed
+# the just-reopened control subscriptions with this same reason, so a flag set at
+# send-time misclassified that as a post-auth refusal instead of the bootstrap
+# race it still was.
 _AUTH_REQUIRED_CLOSE_PREFIX = "auth-required:"
 
 # NIP-01 asks relays to give ``CLOSED`` a machine-readable prefix. These are the
@@ -267,7 +275,8 @@ class BuzzChannel(Channel):
         self._seen_created_at: dict[str, int] = {}  # channel id -> high-water mark of PROCESSED created_at (see _advance_watermark)
         self._chat_subscriptions: set[str] = set()  # channel ids with a live per-channel REQ on the CURRENT connection
         self._resubscribe_attempts: dict[str, int] = {}  # sub id -> CLOSED-recovery attempts spent on the current connection/auth epoch
-        self._auth_completed = False  # has THIS socket completed its NIP-42 handshake? (see _AUTH_REQUIRED_CLOSE_PREFIX)
+        self._auth_completed = False  # has THIS socket's NIP-42 handshake been ACKNOWLEDGED by the relay? (see _handle_auth_ok, _AUTH_REQUIRED_CLOSE_PREFIX)
+        self._pending_auth_event_id: str | None = None  # id of the AUTH event most recently sent, awaiting a matching OK (see _handle_auth_ok / _confirm_auth_if_pending)
         self._session_started_at: int | None = None  # wall clock at which the CURRENT socket opened; anchors the live membership filter
         self._transport: Any = None
         self._task: asyncio.Task | None = None
@@ -357,6 +366,7 @@ class BuzzChannel(Channel):
         self._chat_subscriptions.clear()
         self._resubscribe_attempts.clear()
         self._auth_completed = False
+        self._pending_auth_event_id = None
         self._session_started_at = None
         self._pending_auth_challenge = None
         logger.info("[buzz] channel stopped")
@@ -635,6 +645,38 @@ class BuzzChannel(Channel):
         await self._resubscribe_backoff(attempt)
         await self._ensure_chat_subscription(channel_id)
 
+    def _confirm_auth_if_pending(self) -> None:
+        """Fallback NIP-42 confirmation for a relay that never sends an ``OK`` for AUTH.
+
+        NIP-42 says a relay SHOULD reply ``OK`` to an AUTH event, but "should" is
+        not "does", and this connector must not depend on relay behaviour it
+        cannot control to ever leave its pre-auth-confirmed state. Without this
+        fallback, a relay that silently accepts the AUTH but never sends an ``OK``
+        would leave ``_auth_completed`` false for the rest of the connection, and
+        EVERY later ``auth-required:`` close would misclassify as bootstrap noise
+        -- the same lie this whole fix removes, just permanently instead of for
+        one race window.
+
+        Chosen over a bounded sleep/timeout: this is driven by the relay's own
+        response rather than the wall clock, so it needs no sleep, cannot fire
+        early, and adds no unbounded wait to the read loop. Reaching the discovery
+        subscription's EOSE is a safe signal because it only happens on a REQ the
+        relay actually served: an auth-rejecting relay CLOSEs the just-reopened
+        control subscriptions instead (routed to ``_handle_closed``, never here),
+        so seeing EOSE without a CLOSED first is itself proof the AUTH we sent was
+        accepted, explicit ``OK`` or not.
+
+        Scoped to "we sent an AUTH and have not yet seen an ``OK`` for it"
+        (``_pending_auth_event_id`` set) so it can never fire before an AUTH was
+        even attempted -- where "not yet authenticated" is already the correct
+        read and this must stay a no-op.
+        """
+        if self._pending_auth_event_id is None:
+            return
+        self._pending_auth_event_id = None
+        self._auth_completed = True
+        logger.info("[buzz] treating successful discovery as implicit NIP-42 confirmation (relay sent no explicit OK for our AUTH event)")
+
     async def _on_discovery_complete(self) -> None:
         """EOSE for the discovery subscription: every channel we belong to has now been sent.
 
@@ -652,13 +694,59 @@ class BuzzChannel(Channel):
         permanent, drops the subscription, and does NOT retry -- the cost is one REQ
         per stale channel per reconnect and never a wrong-channel message, since the
         allowlist and signature gates are what decide whether anything is acted on.
+
+        Also the (fallback) point where ``_confirm_auth_if_pending`` is given its
+        chance to run: reaching this EOSE at all is only possible on a REQ the
+        relay actually served, which is evidence the AUTH we sent was accepted even
+        if the relay never sent an explicit ``OK`` for it. See that method's
+        docstring for why this is a safe signal and why a bounded sleep was not
+        used instead.
         """
+        self._confirm_auth_if_pending()
         for channel_id in list(self._channel_meta):
             await self._ensure_chat_subscription(channel_id)
         if self._chat_subscriptions:
             logger.info("[buzz] channel discovery complete: listening to %d channel(s)", len(self._chat_subscriptions))
         else:
             logger.warning("[buzz] channel discovery returned no channels: this identity is not a member of any channel on %s (add it with `buzz channels add-member`)", self._relay_url)
+
+    def _handle_auth_ok(self, event_id: str, accepted: bool, message: str) -> None:
+        """React to a relay ``OK`` acknowledgment, specifically for our outstanding NIP-42 AUTH event.
+
+        NIP-01 sends ``["OK", <event_id>, <accepted>, <message>]`` for every event
+        this connector publishes -- a chat post, an edit, an AUTH -- not only AUTH,
+        and this connector does not otherwise track its own published event ids to
+        correlate them against. So anything that is not the one outstanding AUTH
+        event id is silently ignored here: a rejected chat publish is a delivery
+        problem for ``send()``'s own retry path, not this session's auth
+        bookkeeping.
+
+        This -- the relay's own affirmative reply for the EXACT event id we sent
+        -- is what is allowed to flip ``_auth_completed``, never the act of
+        sending the AUTH event itself. Sending only means we tried: a live relay
+        was observed still processing the AUTH it would eventually accept while it
+        closed the just-reopened control subscriptions with ``auth-required:``, and
+        a flag set at send-time misread that ordinary bootstrap tail as a genuine
+        post-auth refusal (see ``_AUTH_REQUIRED_CLOSE_PREFIX`` and
+        ``_handle_closed``). A relay that never sends an ``OK`` at all is covered
+        by ``_confirm_auth_if_pending``'s fallback instead.
+
+        ``OK ... false`` is the other half of this fix: the relay REJECTED our
+        AUTH, which is a real, actionable problem (a bad key, clock skew outside
+        the relay's tolerance, a relay-side policy) and is logged loudly here
+        rather than silently leaving the connection merely "not yet
+        authenticated". It must never set ``_auth_completed`` -- the session stays
+        in its pre-auth-confirmed state, quiet-recoverable the normal way if a
+        fresh ``AUTH`` challenge arrives.
+        """
+        if event_id != self._pending_auth_event_id:
+            return
+        self._pending_auth_event_id = None
+        if accepted:
+            self._auth_completed = True
+            logger.info("[buzz] relay acknowledged our NIP-42 AUTH event")
+        else:
+            logger.warning("[buzz] relay REJECTED our NIP-42 AUTH event: %s", message or "<no reason given>")
 
     async def _session(self, ws) -> None:
         """Run one relay connection's lifetime: authenticate, discover, subscribe, read frames.
@@ -695,16 +783,27 @@ class BuzzChannel(Channel):
         strictly per socket (cleared on entry AND in ``finally``): it is what lets
         ``_handle_closed`` tell the expected bootstrap ``auth-required:`` refusal
         apart from a relay that stops honouring an already-authenticated session.
-        It is set as soon as the signed AUTH event has been sent, which is the
-        connector's whole side of the NIP-42 handshake -- a relay that then rejects
-        that AUTH and keeps answering ``auth-required:`` is a real problem, and
-        being loud about it is the point.
+
+        It is set ONLY once the relay has ACKNOWLEDGED our AUTH event with a
+        matching ``OK ... true`` (``_handle_auth_ok``) -- never merely because we
+        sent one. A live relay was observed still processing the AUTH we had
+        already sent when it closed the just-reopened control subscriptions with
+        this same ``auth-required:`` reason, so a flag set at send-time
+        misclassified the tail of the ordinary bootstrap race as a post-auth
+        refusal (the operator-facing warning that started this fix). Sending AUTH
+        here only records ``_pending_auth_event_id`` so the eventual ``OK`` can be
+        matched back to it; a relay that never sends one at all is covered by
+        ``_confirm_auth_if_pending``'s fallback (see its docstring). A relay that
+        REJECTS the AUTH (``OK ... false``) is a real, actionable problem and is
+        logged loudly by ``_handle_auth_ok`` -- without ever setting this flag, so
+        the connection is never mistaken for authenticated.
         """
         self._transport = ws
         self._session_started_at = int(time.time())
         self._chat_subscriptions.clear()
         self._resubscribe_attempts.clear()
         self._auth_completed = False
+        self._pending_auth_event_id = None
         try:
             await self._open_control_subscriptions(ws)
             async for raw in ws:
@@ -714,8 +813,8 @@ class BuzzChannel(Channel):
                     challenge = self._pending_auth_challenge
                     self._pending_auth_challenge = None
                     auth = buzz_nostr.build_auth_event(self._keys, self._relay_url, challenge, created_at=int(time.time()))
+                    self._pending_auth_event_id = auth["id"]
                     await ws.send(json.dumps(["AUTH", auth], separators=(",", ":")))
-                    self._auth_completed = True
                     self._chat_subscriptions.clear()
                     self._resubscribe_attempts.clear()
                     await self._open_control_subscriptions(ws)
@@ -724,6 +823,7 @@ class BuzzChannel(Channel):
             self._chat_subscriptions.clear()
             self._resubscribe_attempts.clear()
             self._auth_completed = False
+            self._pending_auth_event_id = None
             self._session_started_at = None
 
     async def _run_loop(self) -> None:
@@ -820,6 +920,8 @@ class BuzzChannel(Channel):
         kind = frame[0]
         if kind == "AUTH" and len(frame) >= 2:
             self._pending_auth_challenge = str(frame[1])
+        elif kind == "OK" and len(frame) >= 3:
+            self._handle_auth_ok(str(frame[1]), frame[2] is True, str(frame[3]) if len(frame) >= 4 else "")
         elif kind == "EOSE" and len(frame) >= 2 and frame[1] == DISCOVERY_SUB_ID:
             await self._on_discovery_complete()
         elif kind == "CLOSED" and len(frame) >= 2:
@@ -844,7 +946,7 @@ class BuzzChannel(Channel):
                 # otherwise well-shaped EVENT frame (e.g. a non-integer created_at,
                 # or a "tags" field that isn't a list of [name, value, ...] lists).
                 logger.warning("[buzz] malformed relay event ignored", exc_info=True)
-        # OK / other EOSE / NOTICE frames need no action
+        # other EOSE / NOTICE frames need no action
 
     def _handle_meta_event(self, ev: dict) -> str | None:
         """Cache kind-39000 channel metadata: ``d`` = channel id, ``t`` = type, ``name``.

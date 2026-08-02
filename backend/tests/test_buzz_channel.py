@@ -1115,11 +1115,13 @@ def test_stop_clears_per_connection_state_so_a_restart_cannot_edit_stale_placeho
         ch._last_requester[(CHANNEL, None)] = OWNER
         ch._channel_meta[CHANNEL] = {"type": "dm", "name": "x"}
         ch._pending_auth_challenge = "challenge"
+        ch._pending_auth_event_id = "auth-event-id"
 
         await ch.stop()
 
         assert not ch._stream_targets and not ch._stream_tails and not ch._last_requester
         assert not ch._channel_meta and ch._pending_auth_challenge is None
+        assert ch._pending_auth_event_id is None
 
     asyncio.run(run())
 
@@ -1828,7 +1830,16 @@ def test_auth_completed_flag_is_per_connection():
     asyncio.run(run())
 
 
-def test_session_marks_auth_completed_once_the_nip42_handshake_is_sent():
+def test_session_does_not_mark_auth_completed_merely_because_auth_was_sent():
+    """Sending the AUTH event is only our half of the NIP-42 handshake.
+
+    Replaces a previous version of this test that pinned the exact bug this fix
+    removes: it asserted `_auth_completed` became true the instant AUTH was sent,
+    with no `OK` anywhere in the script. A live relay was observed still
+    processing an AUTH it had already received -- and closing the just-reopened
+    control subscriptions with `auth-required:` -- well after the connector had
+    sent it, so `_auth_completed` must stay false until the relay actually
+    acknowledges the exact event id (see `test_ok_true_for_our_auth_event_marks_the_connection_authenticated`)."""
     ch, _ = _started()
     seen = []
     ws = ScriptedWS(['["AUTH","challenge-1"]'])
@@ -1840,7 +1851,116 @@ def test_session_marks_auth_completed_once_the_nip42_handshake_is_sent():
 
     ch._open_control_subscriptions = spy
     asyncio.run(ch._session(ws))
-    assert seen == [False, True]  # pre-auth open, then the post-AUTH re-open
+    assert seen == [False, False]  # pre-auth open, then the post-AUTH-SENT re-open -- still not ack'd
+    assert ch._pending_auth_event_id is None  # cleared by _session's finally on teardown, ack or not
+
+
+def test_auth_required_close_between_auth_sent_and_relay_ok_is_still_bootstrap(caplog):
+    """THE LIVE DEFECT this fix removes.
+
+    The relay is still processing our AUTH when it closes the control
+    subscription the auth branch just re-opened. Before the relay's OK for THIS
+    auth event arrives, that CLOSED must still read as the ordinary bootstrap
+    race (quiet, recovered) -- not a post-auth outage. Fails against the pre-fix
+    connector, which flipped `_auth_completed` true the moment AUTH was SENT, so
+    this exact sequence misclassified as a genuine post-auth refusal and logged
+    the live warning: "relay demanded re-authentication for buzz-membership AFTER
+    this connection completed NIP-42 auth"."""
+    ch, _ = _started()
+    ws = ScriptedWS(
+        [
+            '["AUTH","challenge-1"]',
+            json.dumps(["CLOSED", "buzz-membership", "auth-required: not authenticated"]),
+        ]
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        asyncio.run(ch._session(ws))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], f"must stay quiet before the relay OKs our AUTH, got: {warnings}"
+    assert "pending NIP-42 auth" in caplog.text
+
+
+def test_ok_true_for_our_auth_event_marks_the_connection_authenticated():
+    ch, _ = _started()
+    ch._pending_auth_event_id = "auth-event-id-1"
+    asyncio.run(ch.handle_relay_frame(json.dumps(["OK", "auth-event-id-1", True, "welcome"])))
+    assert ch._auth_completed is True
+    assert ch._pending_auth_event_id is None
+
+
+def test_ok_false_for_our_auth_event_is_a_loud_failure_and_does_not_authenticate(caplog):
+    """A relay-rejected AUTH is a real, actionable problem -- surfaced loudly --
+    and must never leave the connection looking authenticated."""
+    ch, _ = _started()
+    ch._pending_auth_event_id = "auth-event-id-1"
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["OK", "auth-event-id-1", False, "bad signature"])))
+
+    assert ch._auth_completed is False
+    assert ch._pending_auth_event_id is None
+    assert "bad signature" in caplog.text
+    assert "REJECTED" in caplog.text
+
+
+def test_ok_frame_for_an_unrelated_event_does_not_affect_auth_state():
+    """OK is sent for every published event (chat posts, edits, AUTH), not only
+    AUTH. Anything that is not the one outstanding AUTH event id must be a no-op
+    here -- a rejected chat publish is send()'s own retry-path problem, not this
+    session's auth bookkeeping."""
+    ch, _ = _started()
+    ch._pending_auth_event_id = "auth-event-id-1"
+    asyncio.run(ch.handle_relay_frame(json.dumps(["OK", "some-other-event-id", True, ""])))
+    assert ch._auth_completed is False
+    assert ch._pending_auth_event_id == "auth-event-id-1"  # untouched
+
+
+def test_auth_required_close_after_relay_ok_true_stays_loud_via_the_real_ok_path(caplog):
+    """The complementary required case, driven through the real OK handler rather
+    than a manually-set flag: once the relay has genuinely acknowledged our AUTH,
+    the same `auth-required:` reason on a later close is a real problem again."""
+    ch, _ = _started()
+    ch._pending_auth_event_id = "auth-event-id-1"
+    asyncio.run(ch.handle_relay_frame(json.dumps(["OK", "auth-event-id-1", True, ""])))
+    assert ch._auth_completed is True
+    ch._transport = FakeTransport()
+
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-membership", "auth-required: not authenticated"])))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("buzz-membership" in m and "AFTER this connection completed NIP-42 auth" in m for m in warnings), warnings
+
+
+def test_discovery_eose_implicitly_confirms_auth_when_relay_sends_no_ok():
+    """Fallback for a relay that never sends an explicit `OK` for AUTH (NIP-42 says
+    it SHOULD, not that it MUST). Reaching discovery EOSE on a re-opened control
+    subscription is only possible if the relay actually accepted the session --
+    an auth-rejecting relay CLOSEs it instead -- so this is treated as implicit
+    confirmation rather than leaving `_auth_completed` false (and every later
+    `auth-required:` close misclassified as bootstrap noise) for the rest of the
+    connection."""
+    ch, _ = _started()
+    ch._pending_auth_event_id = "auth-event-id-1"
+
+    asyncio.run(ch._on_discovery_complete())
+
+    assert ch._auth_completed is True
+    assert ch._pending_auth_event_id is None
+
+
+def test_discovery_eose_without_a_pending_auth_send_does_not_fabricate_confirmation():
+    """The fallback must only fire for an AUTH we actually sent and are awaiting an
+    ack for -- not on every ordinary discovery EOSE (e.g. the very first, pre-auth
+    one, if the relay happens to allow unauthenticated discovery reads)."""
+    ch, _ = _started()
+    assert ch._pending_auth_event_id is None
+
+    asyncio.run(ch._on_discovery_complete())
+
+    assert ch._auth_completed is False
 
 
 # -- FINDING 1 defense in depth: never publish DeerFlow's hidden model context -----
