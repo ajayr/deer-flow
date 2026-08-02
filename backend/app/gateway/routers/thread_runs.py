@@ -33,13 +33,17 @@ from app.gateway.checkpoint_lineage import (
     find_checkpoint_before_message_chronologically,
     is_duration_only_checkpoint,
 )
+from app.gateway.context_usage import build_context_usage
 from app.gateway.deps import get_current_user, get_feedback_repo, get_run_event_store, get_run_manager, get_run_store, get_stream_bridge
 from app.gateway.pagination import trim_run_message_page
 from app.gateway.run_models import RunCreateRequest
 from app.gateway.services import build_checkpoint_state_accessor, build_thread_checkpoint_state_accessor, sse_consumer, start_run, wait_for_run_completion
 from app.gateway.utils import sanitize_log_param
+from deerflow.agents.middlewares.dynamic_context_middleware import strip_injected_user_message_id_suffix
 from deerflow.runtime import CancelOutcome, RunRecord, RunStatus, serialize_channel_values_for_api
+from deerflow.runtime.secret_context import redact_config_secrets, redact_metadata_secrets
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY, get_original_user_content_text, message_to_text
+from deerflow.utils.thread_id import ThreadId
 from deerflow.workspace_changes import get_workspace_changes_response
 
 logger = logging.getLogger(__name__)
@@ -74,6 +78,41 @@ def compute_run_durations(runs) -> dict[str, int]:
             except Exception:
                 logger.warning("Failed to parse timestamps for run %s", r.run_id, exc_info=True)
     return durations
+
+
+def stamp_turn_duration_on_last_ai(messages, run_durations: dict[str, int]) -> None:
+    """Attach each run's elapsed seconds to that run's final visible AI message only.
+
+    ``turn_duration`` is the run's wall-clock lifetime (``compute_run_durations``),
+    not model thinking time — it belongs to the run, not to individual messages.
+    Stamping every AI message made the UI repeat the same number once per
+    message and let tool-wait time read as thinking latency (#4152).
+    Middleware-caller messages (e.g. title generation) are skipped so the badge
+    lands on the assistant's actual final answer.
+
+    Accepts both message shapes that carry ``run_id``: event-store rows, which
+    wrap the message payload in a ``content`` dict, and flat serialized
+    checkpoint messages (``/history``), where the payload is the row itself.
+
+    The middleware skip is only effective on the event-store shape: checkpoint
+    messages replayed on ``/history`` never carry ``metadata.caller`` (they are
+    plain serialized LangChain messages), so this skip is inert there. That is
+    not a gap in practice — middleware writes (e.g. title generation) go to
+    thread metadata, not the ``messages`` channel, so no middleware message
+    reaches a checkpoint's ``messages`` list to begin with.
+    """
+    stamped: set[str] = set()
+    for msg in reversed(messages):
+        rid = msg.get("run_id")
+        if not rid or rid in stamped or rid not in run_durations:
+            continue
+        content = msg.get("content")
+        payload = content if isinstance(content, dict) else msg
+        metadata = msg.get("metadata") or {}
+        is_middleware = str(metadata.get("caller", "")).startswith("middleware:")
+        if payload.get("type") == "ai" and not is_middleware:
+            payload.setdefault("additional_kwargs", {})["turn_duration"] = run_durations[rid]
+            stamped.add(rid)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +182,12 @@ class ThreadTokenUsageCallerBreakdown(BaseModel):
     middleware: int = 0
 
 
+class ThreadContextUsage(BaseModel):
+    token_count: int = 0
+    max_context_tokens: int | None = None
+    percentage: float | None = None
+
+
 class ThreadTokenUsageResponse(BaseModel):
     thread_id: str
     total_tokens: int = 0
@@ -151,6 +196,7 @@ class ThreadTokenUsageResponse(BaseModel):
     total_runs: int = 0
     by_model: dict[str, ThreadTokenUsageModelBreakdown] = Field(default_factory=dict)
     by_caller: ThreadTokenUsageCallerBreakdown = Field(default_factory=ThreadTokenUsageCallerBreakdown)
+    context_usage: ThreadContextUsage | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +259,17 @@ async def _raise_lease_valid_elsewhere(
 
 
 def _record_to_response(record: RunRecord) -> RunResponse:
+    kwargs = dict(record.kwargs or {})
+    if "config" in kwargs:
+        kwargs["config"] = redact_config_secrets(kwargs["config"])
+
     return RunResponse(
         run_id=record.run_id,
         thread_id=record.thread_id,
         assistant_id=record.assistant_id,
         status=record.status.value,
-        metadata=record.metadata,
-        kwargs=record.kwargs,
+        metadata=redact_metadata_secrets(record.metadata),
+        kwargs=kwargs,
         multitask_strategy=record.multitask_strategy,
         created_at=record.created_at,
         updated_at=record.updated_at,
@@ -339,7 +389,12 @@ def _clean_human_message_for_regenerate(message: Any) -> dict[str, Any]:
         "content": [{"type": "text", "text": content}],
         "additional_kwargs": additional_kwargs,
     }
-    message_id = _message_id(message)
+    # Replay the id the client originally sent. The dynamic-context reminder
+    # re-keys the first user message of a thread to `{id}__user`, and replaying
+    # that persisted id into a state that has no reminder yet makes the
+    # middleware treat the turn as already injected, silently dropping the date
+    # and memory block the original turn had.
+    message_id = strip_injected_user_message_id_suffix(_message_id(message))
     if message_id:
         clean_message["id"] = message_id
     name = _message_name(message)
@@ -369,6 +424,11 @@ def _clean_human_message_for_edit(message: Any, *, replacement_id: str, replacem
 
 def _is_terminal_assistant_text_message(message: Any) -> bool:
     return _is_visible_ai_message(message) and bool(_message_text(message).strip()) and not _message_tool_calls(message)
+
+
+def _has_title(values: dict[str, Any]) -> bool:
+    title = values.get("title")
+    return isinstance(title, str) and bool(title)
 
 
 def _has_active_goal(snapshot: Any) -> bool:
@@ -541,6 +601,33 @@ async def _require_successful_source_run(thread_id: str, run_id: str, request: R
     return record
 
 
+async def _find_interrupted_target_run_id(
+    thread_id: str,
+    source_human: Any,
+    request: Request,
+) -> str | None:
+    source_run_id = _message_additional_kwargs(source_human).get("run_id")
+    if not isinstance(source_run_id, str) or not source_run_id:
+        return None
+
+    run_mgr = get_run_manager(request)
+    user_id = await get_current_user(request)
+    record = await run_mgr.get(source_run_id, user_id=user_id)
+    if record is None:
+        records = await run_mgr.list_by_thread(thread_id, user_id=user_id, limit=20)
+        record = next(
+            (candidate for candidate in records if getattr(candidate, "run_id", None) == source_run_id),
+            None,
+        )
+    if record is None:
+        return None
+    if getattr(record, "thread_id", None) != thread_id:
+        return None
+    if _run_status_value(record) != RunStatus.interrupted.value:
+        return None
+    return source_run_id
+
+
 async def _prepare_regenerate_payload(thread_id: str, message_id: str, request: Request) -> RegeneratePrepareResponse:
     accessor, latest_config = await build_thread_checkpoint_state_accessor(request, thread_id=thread_id)
     try:
@@ -555,18 +642,41 @@ async def _prepare_regenerate_payload(thread_id: str, message_id: str, request: 
     messages = _checkpoint_messages(latest_checkpoint)
     target_index = next((i for i, message in enumerate(messages) if _message_id(message) == message_id), None)
     if target_index is None:
-        raise HTTPException(status_code=404, detail=f"Message {message_id} not found")
-    target_message = messages[target_index]
-    if not _is_visible_ai_message(target_message):
-        raise HTTPException(status_code=409, detail="Only visible assistant messages can be regenerated")
+        # A response interrupted during an LLM call can be visible in the live
+        # stream without ever reaching a checkpoint. The server-stamped run ID
+        # on the latest user message is the durable link to that partial turn.
+        previous_human = next(
+            (message for message in reversed(messages) if _is_visible_human_message(message)),
+            None,
+        )
+        target_run_id = await _find_interrupted_target_run_id(thread_id, previous_human, request) if previous_human is not None else None
+        if target_run_id is None:
+            raise HTTPException(status_code=404, detail=f"Message {message_id} not found")
+    else:
+        target_message = messages[target_index]
+        if not _is_visible_ai_message(target_message):
+            raise HTTPException(status_code=409, detail="Only visible assistant messages can be regenerated")
 
-    latest_visible_ai = next((message for message in reversed(messages) if _is_visible_ai_message(message)), None)
-    if _message_id(latest_visible_ai) != message_id:
-        raise HTTPException(status_code=409, detail="Only the latest assistant message can be regenerated")
+        latest_visible_ai = next((message for message in reversed(messages) if _is_visible_ai_message(message)), None)
+        if _message_id(latest_visible_ai) != message_id:
+            raise HTTPException(status_code=409, detail="Only the latest assistant message can be regenerated")
 
-    previous_human = next((message for message in reversed(messages[:target_index]) if _is_visible_human_message(message)), None)
+        previous_human = next((message for message in reversed(messages[:target_index]) if _is_visible_human_message(message)), None)
+        target_run_id = (
+            await _find_target_run_id(
+                thread_id,
+                message_id,
+                target_message,
+                previous_human,
+                request,
+            )
+            if previous_human is not None
+            else None
+        )
     if previous_human is None:
         raise HTTPException(status_code=409, detail="Could not find the user message for this assistant response")
+    if target_run_id is None:
+        raise HTTPException(status_code=409, detail="Could not find source run for assistant message")
     previous_human_id = _message_id(previous_human)
     if not previous_human_id:
         raise HTTPException(status_code=409, detail="The source user message is missing an id")
@@ -576,13 +686,6 @@ async def _prepare_regenerate_payload(thread_id: str, message_id: str, request: 
         previous_human_id,
         request,
         head_checkpoint=latest_checkpoint,
-    )
-    target_run_id = await _find_target_run_id(
-        thread_id,
-        message_id,
-        target_message,
-        previous_human,
-        request,
     )
     checkpoint = _checkpoint_response(base_checkpoint_tuple)
     metadata = {
@@ -643,7 +746,12 @@ async def _prepare_edit_regenerate_payload(
     if not source_ai_id:
         raise HTTPException(status_code=409, detail="The source assistant message is missing an id")
 
-    base_checkpoint_tuple = await _find_base_checkpoint_before_human(thread_id, source_human_id, request)
+    base_checkpoint_tuple = await _find_base_checkpoint_before_human(
+        thread_id,
+        source_human_id,
+        request,
+        head_checkpoint=latest_checkpoint,
+    )
     target_run_id = await _find_target_run_id(thread_id, source_ai_id, source_ai, source_human, request)
     source_record = await _require_successful_source_run(thread_id, target_run_id, request)
     checkpoint = _checkpoint_response(base_checkpoint_tuple)
@@ -662,16 +770,28 @@ async def _prepare_edit_regenerate_payload(
         "edit_message_id": replacement_human_message_id,
         "edit_version_group_id": edit_version_group_id,
     }
+    edit_input: dict[str, Any] = {
+        "messages": [
+            _clean_human_message_for_edit(
+                source_human,
+                replacement_id=replacement_human_message_id,
+                replacement_text=normalized_text,
+            )
+        ]
+    }
+    base_values = base_checkpoint_tuple.values if isinstance(getattr(base_checkpoint_tuple, "values", None), dict) else {}
+    latest_values = latest_checkpoint.values if isinstance(latest_checkpoint.values, dict) else {}
+    latest_title = latest_values.get("title")
+    if _has_title(base_values) and isinstance(latest_title, str) and latest_title:
+        # The replay base can predate a manual rename, so replay the current
+        # title rather than letting checkpoint rollback restore the older one
+        # (#4457, the same rollback regenerate already guards against). An
+        # untitled base is deliberately left alone: it belongs to a thread the
+        # title middleware has not named yet, and pinning the current title
+        # there would keep a name generated from the prompt this edit replaced.
+        edit_input["title"] = latest_title
     return EditRegeneratePrepareResponse(
-        input={
-            "messages": [
-                _clean_human_message_for_edit(
-                    source_human,
-                    replacement_id=replacement_human_message_id,
-                    replacement_text=normalized_text,
-                )
-            ]
-        },
+        input=edit_input,
         checkpoint=checkpoint,
         metadata=metadata,
         target_run_id=target_run_id,
@@ -694,7 +814,7 @@ async def _default_history_hidden_run_ids(run_mgr: Any, thread_id: str, *, user_
 @router.post("/{thread_id}/runs/regenerate/prepare", response_model=RegeneratePrepareResponse)
 @require_permission("runs", "create", owner_check=True, require_existing=True)
 async def prepare_regenerate_run(
-    thread_id: str,
+    thread_id: ThreadId,
     body: RegeneratePrepareRequest,
     request: Request,
 ) -> RegeneratePrepareResponse:
@@ -705,7 +825,7 @@ async def prepare_regenerate_run(
 @router.post("/{thread_id}/runs/edit-regenerate/prepare", response_model=EditRegeneratePrepareResponse)
 @require_permission("runs", "create", owner_check=True, require_existing=True)
 async def prepare_edit_regenerate_run(
-    thread_id: str,
+    thread_id: ThreadId,
     body: EditRegeneratePrepareRequest,
     request: Request,
 ) -> EditRegeneratePrepareResponse:
@@ -715,7 +835,7 @@ async def prepare_edit_regenerate_run(
 
 @router.post("/{thread_id}/runs", response_model=RunResponse)
 @require_permission("runs", "create", owner_check=True, require_existing=True)
-async def create_run(thread_id: str, body: RunCreateRequest, request: Request) -> RunResponse:
+async def create_run(thread_id: ThreadId, body: RunCreateRequest, request: Request) -> RunResponse:
     """Create a background run (returns immediately)."""
     record = await start_run(body, thread_id, request)
     return _record_to_response(record)
@@ -723,7 +843,7 @@ async def create_run(thread_id: str, body: RunCreateRequest, request: Request) -
 
 @router.post("/{thread_id}/runs/stream")
 @require_permission("runs", "create", owner_check=True, require_existing=True)
-async def stream_run(thread_id: str, body: RunCreateRequest, request: Request) -> StreamingResponse:
+async def stream_run(thread_id: ThreadId, body: RunCreateRequest, request: Request) -> StreamingResponse:
     """Create a run and stream events via SSE.
 
     The response includes a ``Content-Location`` header with the run's
@@ -751,7 +871,7 @@ async def stream_run(thread_id: str, body: RunCreateRequest, request: Request) -
 
 @router.post("/{thread_id}/runs/wait", response_model=dict)
 @require_permission("runs", "create", owner_check=True, require_existing=True)
-async def wait_run(thread_id: str, body: RunCreateRequest, request: Request) -> dict:
+async def wait_run(thread_id: ThreadId, body: RunCreateRequest, request: Request) -> dict:
     """Create a run and block until it completes, returning the final state."""
     bridge = get_stream_bridge(request)
     run_mgr = get_run_manager(request)
@@ -780,7 +900,7 @@ async def wait_run(thread_id: str, body: RunCreateRequest, request: Request) -> 
 
 @router.get("/{thread_id}/runs", response_model=list[RunResponse])
 @require_permission("runs", "read", owner_check=True)
-async def list_runs(thread_id: str, request: Request) -> list[RunResponse]:
+async def list_runs(thread_id: ThreadId, request: Request) -> list[RunResponse]:
     """List all runs for a thread."""
     run_mgr = get_run_manager(request)
     user_id = await get_current_user(request)
@@ -790,7 +910,7 @@ async def list_runs(thread_id: str, request: Request) -> list[RunResponse]:
 
 @router.get("/{thread_id}/runs/{run_id}", response_model=RunResponse)
 @require_permission("runs", "read", owner_check=True)
-async def get_run(thread_id: str, run_id: str, request: Request) -> RunResponse:
+async def get_run(thread_id: ThreadId, run_id: str, request: Request) -> RunResponse:
     """Get details of a specific run."""
     run_mgr = get_run_manager(request)
     user_id = await get_current_user(request)
@@ -803,7 +923,7 @@ async def get_run(thread_id: str, run_id: str, request: Request) -> RunResponse:
 @router.post("/{thread_id}/runs/{run_id}/cancel")
 @require_permission("runs", "cancel", owner_check=True, require_existing=True)
 async def cancel_run(
-    thread_id: str,
+    thread_id: ThreadId,
     run_id: str,
     request: Request,
     wait: bool = Query(default=False, description="Block until run completes after cancel"),
@@ -817,8 +937,8 @@ async def cancel_run(
     - wait=false: Return immediately with 202
 
     In multi-worker deployments, a cancel landing on a non-owning worker
-    can take over the run when the owner's lease has expired.  When the
-    lease is still valid a 409 + ``Retry-After`` header is returned.
+    durably notifies the owner when its lease is live, or takes over and
+    terminalizes the run when that lease has expired.
     """
     run_mgr = get_run_manager(request)
     record = await run_mgr.get(run_id)
@@ -827,15 +947,30 @@ async def cancel_run(
 
     outcome = await run_mgr.cancel(run_id, action=action)
 
-    # Success paths — the run was either cancelled locally or taken over
-    # from a dead worker.
-    if outcome in (CancelOutcome.cancelled, CancelOutcome.taken_over):
+    # Success paths — the run was cancelled locally, durably requested from
+    # a live owner, or taken over from a dead worker.
+    if outcome in (
+        CancelOutcome.cancelled,
+        CancelOutcome.requested,
+        CancelOutcome.taken_over,
+    ):
         if wait and record.task is not None:
             try:
                 await record.task
             except asyncio.CancelledError:
                 pass
             return Response(status_code=204)
+        if wait and outcome == CancelOutcome.requested:
+            bridge = get_stream_bridge(request)
+            if record.store_only and bridge.supports_cross_process:
+                completed = await wait_for_run_completion(
+                    bridge,
+                    record,
+                    request,
+                    run_mgr,
+                )
+                if completed:
+                    return Response(status_code=204)
         return Response(status_code=202)
 
     if outcome == CancelOutcome.lease_valid_elsewhere:
@@ -847,7 +982,7 @@ async def cancel_run(
 
 @router.get("/{thread_id}/runs/{run_id}/join")
 @require_permission("runs", "read", owner_check=True)
-async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingResponse:
+async def join_run(thread_id: ThreadId, run_id: str, request: Request) -> StreamingResponse:
     """Join an existing run's SSE stream."""
     run_mgr = get_run_manager(request)
     record = await run_mgr.get(run_id)
@@ -876,7 +1011,7 @@ async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingRe
 @router.post("/{thread_id}/runs/{run_id}/stream", response_model=None)
 @require_permission("runs", "read", owner_check=True)
 async def stream_existing_run(
-    thread_id: str,
+    thread_id: ThreadId,
     run_id: str,
     request: Request,
     action: Literal["interrupt", "rollback"] | None = Query(default=None, description="Cancel action"),
@@ -906,16 +1041,29 @@ async def stream_existing_run(
             # the client doesn't hang on an SSE subscription this worker can
             # never serve.
             return Response(status_code=202)
-        if outcome != CancelOutcome.cancelled:
+        if outcome not in (CancelOutcome.cancelled, CancelOutcome.requested):
             if outcome == CancelOutcome.lease_valid_elsewhere:
                 await _raise_lease_valid_elsewhere(run_id, run_mgr, record)
             raise HTTPException(status_code=409, detail=_cancel_conflict_detail(run_id, record))
+        if outcome == CancelOutcome.requested and record.store_only and not bridge.supports_cross_process:
+            # The request is durable, but this bridge cannot observe the
+            # owner's stream. Returning 202 is safer than hanging forever on
+            # a process-local subscription.
+            return Response(status_code=202)
         if wait and record.task is not None:
             try:
                 await record.task
             except (asyncio.CancelledError, Exception):
                 pass
             return Response(status_code=204)
+        if wait and outcome == CancelOutcome.requested:
+            completed = await wait_for_run_completion(
+                bridge,
+                record,
+                request,
+                run_mgr,
+            )
+            return Response(status_code=204 if completed else 202)
 
     return StreamingResponse(
         sse_consumer(bridge, record, request, run_mgr),
@@ -936,7 +1084,7 @@ async def stream_existing_run(
 @router.get("/{thread_id}/messages")
 @require_permission("runs", "read", owner_check=True)
 async def list_thread_messages(
-    thread_id: str,
+    thread_id: ThreadId,
     request: Request,
     limit: int = Query(default=50, ge=1, le=200),
     before_seq: int | None = Query(default=None, ge=1),
@@ -998,14 +1146,7 @@ async def list_thread_messages(
     run_durations = compute_run_durations(runs)
 
     if run_durations:
-        for msg in messages:
-            content = msg.get("content", {})
-            if isinstance(content, dict) and content.get("type") == "ai":
-                rid = msg.get("run_id")
-                if rid and rid in run_durations:
-                    if "additional_kwargs" not in content:
-                        content["additional_kwargs"] = {}
-                    content["additional_kwargs"]["turn_duration"] = run_durations[rid]
+        stamp_turn_duration_on_last_ai(messages, run_durations)
 
     return messages
 
@@ -1197,7 +1338,7 @@ async def _enrich_thread_message_page(
 @router.get("/{thread_id}/messages/page", response_model=ThreadMessagesPageResponse)
 @require_permission("runs", "read", owner_check=True)
 async def list_thread_messages_page(
-    thread_id: str,
+    thread_id: ThreadId,
     request: Request,
     limit: int = Query(default=50, ge=1, le=200),
     before_seq: int | None = Query(default=None, ge=1),
@@ -1225,7 +1366,7 @@ async def list_thread_messages_page(
 @router.get("/{thread_id}/runs/{run_id}/messages")
 @require_permission("runs", "read", owner_check=True)
 async def list_run_messages(
-    thread_id: str,
+    thread_id: ThreadId,
     run_id: str,
     request: Request,
     limit: int = Query(default=50, le=200, ge=1),
@@ -1251,16 +1392,8 @@ async def list_run_messages(
         record = await run_mgr.get(run_id)
         if record:
             durations = compute_run_durations([record])
-            duration = durations.get(run_id)
-            if duration is not None:
-                for msg in reversed(data):
-                    content = msg.get("content")
-                    metadata = msg.get("metadata", {})
-                    is_middleware = str(metadata.get("caller", "")).startswith("middleware:")
-                    if isinstance(content, dict) and content.get("type") == "ai" and not is_middleware:
-                        if "additional_kwargs" not in content:
-                            content["additional_kwargs"] = {}
-                        content["additional_kwargs"]["turn_duration"] = duration
+            if durations:
+                stamp_turn_duration_on_last_ai(data, durations)
 
     return {"data": data, "has_more": has_more}
 
@@ -1268,7 +1401,7 @@ async def list_run_messages(
 @router.get("/{thread_id}/runs/{run_id}/events")
 @require_permission("runs", "read", owner_check=True)
 async def list_run_events(
-    thread_id: str,
+    thread_id: ThreadId,
     run_id: str,
     request: Request,
     event_types: str | None = Query(default=None),
@@ -1283,13 +1416,29 @@ async def list_run_events(
     """
     event_store = get_run_event_store(request)
     types = event_types.split(",") if event_types else None
-    return await event_store.list_events(thread_id, run_id, event_types=types, task_id=task_id, limit=limit, after_seq=after_seq)
+    events = await event_store.list_events(
+        thread_id,
+        run_id,
+        event_types=types,
+        task_id=task_id,
+        limit=limit,
+        after_seq=after_seq,
+    )
+    return [
+        {
+            **event,
+            "metadata": redact_metadata_secrets(event.get("metadata")),
+        }
+        if isinstance(event, dict) and "metadata" in event
+        else event
+        for event in events
+    ]
 
 
 @router.get("/{thread_id}/runs/{run_id}/workspace-changes")
 @require_permission("runs", "read", owner_check=True)
 async def get_run_workspace_changes(
-    thread_id: str,
+    thread_id: ThreadId,
     run_id: str,
     request: Request,
     include_files: bool = Query(default=True),
@@ -1309,7 +1458,7 @@ async def get_run_workspace_changes(
 @router.get("/{thread_id}/token-usage", response_model=ThreadTokenUsageResponse)
 @require_permission("threads", "read", owner_check=True)
 async def thread_token_usage(
-    thread_id: str,
+    thread_id: ThreadId,
     request: Request,
     include_active: bool = Query(default=False, description="Include running run progress snapshots"),
 ) -> ThreadTokenUsageResponse:
@@ -1319,4 +1468,5 @@ async def thread_token_usage(
         agg = await run_store.aggregate_tokens_by_thread(thread_id, include_active=True)
     else:
         agg = await run_store.aggregate_tokens_by_thread(thread_id)
-    return ThreadTokenUsageResponse(thread_id=thread_id, **agg)
+    context_usage = await build_context_usage(request, thread_id, run_store)
+    return ThreadTokenUsageResponse(thread_id=thread_id, context_usage=context_usage, **agg)

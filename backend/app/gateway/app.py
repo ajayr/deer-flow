@@ -10,7 +10,7 @@ from app.gateway.auth_disabled import warn_if_auth_disabled_enabled
 from app.gateway.auth_middleware import AuthMiddleware
 from app.gateway.browser_capability import ensure_browser_runtime_available
 from app.gateway.config import get_gateway_config
-from app.gateway.csrf_middleware import CSRFMiddleware, get_configured_cors_origins
+from app.gateway.csrf_middleware import CORS_EXPOSED_HEADERS, CSRFMiddleware, get_configured_cors_origins
 from app.gateway.deps import langgraph_runtime
 from app.gateway.routers import (
     agents,
@@ -210,6 +210,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     config = get_gateway_config()
     logger.info(f"Starting API Gateway on {config.host}:{config.port}")
 
+    from deerflow.skills.projection import ensure_public_skill_projection
+
+    public_projection_ready = await asyncio.to_thread(ensure_public_skill_projection, app_config=startup_config)
+    if public_projection_ready:
+        logger.info("Ensured the public skill projection; user projections repair lazily on sandbox acquire")
+
     # Agent observability (Monocle). Off by default; enabled with
     # MONOCLE_TRACING. Initialized here at startup — not at import time — so a
     # plain `import deerflow.agents` never installs a process-global tracer.
@@ -228,7 +234,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from deerflow.agents.memory import get_memory_manager
 
         if startup_config.memory.enabled:
-            manager = get_memory_manager()
+            manager = await asyncio.to_thread(get_memory_manager)
             warm_retrieval = getattr(manager, "warm_retrieval", None)
             if callable(warm_retrieval):
                 retrieval_warm_task = asyncio.create_task(
@@ -252,7 +258,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         from deerflow.agents.memory import get_memory_manager
 
-        manager = get_memory_manager()
+        manager = await asyncio.to_thread(get_memory_manager)
         warmed = await asyncio.wait_for(
             asyncio.to_thread(manager.warm),
             timeout=5,
@@ -411,7 +417,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             if app_cfg.memory.enabled:
                 from deerflow.agents.memory import get_memory_manager
 
-                manager = get_memory_manager()
+                manager = await asyncio.to_thread(get_memory_manager)
                 flush_timeout = app_cfg.memory.shutdown_flush_timeout_seconds
                 completed = await asyncio.to_thread(manager.shutdown_flush, flush_timeout)
                 if completed:
@@ -539,7 +545,11 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
 
     # CORS: the unified nginx endpoint is same-origin by default. Split-origin
     # browser clients must opt in with this explicit Gateway allowlist so CORS
-    # and CSRF origin checks share the same source of truth.
+    # and CSRF origin checks share the same source of truth. They also need the
+    # run id the Gateway returns in a non-safelisted response header; without
+    # exposing it the SDK never reports a created run, so a new thread keeps its
+    # placeholder route and every action gated on an established thread stays
+    # hidden until the page is reloaded.
     cors_origins = sorted(get_configured_cors_origins())
     if cors_origins:
         app.add_middleware(
@@ -548,6 +558,7 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=list(CORS_EXPOSED_HEADERS),
         )
 
     # Request trace correlation: when logging.enhance.enabled=true, bind one

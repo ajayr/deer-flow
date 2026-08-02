@@ -5,18 +5,62 @@ import contextlib
 import hashlib
 import importlib
 import stat
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from deerflow.config.paths import Paths, join_host_path
+from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.runtime.user_context import reset_current_user, set_current_user
 
 _LEGACY_COLLIDING_IDENTITIES = (
     ("user-9721", "thread-9721"),
     ("user-94361", "thread-94361"),
 )
+
+# ── thread-data mount configuration ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("sandbox_overrides", "expected"),
+    [
+        ({}, None),
+        ({"thread_data_mounts": True}, True),
+        ({"thread_data_mounts": False}, False),
+    ],
+)
+def test_load_config_preserves_thread_data_mounts_override(sandbox_overrides, expected, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    sandbox_config = SandboxConfig(
+        use="deerflow.community.aio_sandbox:AioSandboxProvider",
+        **sandbox_overrides,
+    )
+    app_config = SimpleNamespace(sandbox=sandbox_config, stream_bridge=None)
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: app_config)
+    provider = aio_mod.AioSandboxProvider.__new__(aio_mod.AioSandboxProvider)
+
+    assert provider._load_config()["thread_data_mounts"] is expected
+
+
+@pytest.mark.parametrize(
+    ("backend_is_local", "override", "expected"),
+    [
+        (True, None, True),
+        (False, None, False),
+        (True, False, False),
+        (False, True, True),
+    ],
+)
+def test_thread_data_mounts_override_precedes_backend_detection(backend_is_local, override, expected):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = aio_mod.AioSandboxProvider.__new__(aio_mod.AioSandboxProvider)
+    provider._config = {} if override is None else {"thread_data_mounts": override}
+    provider._backend = object.__new__(aio_mod.LocalContainerBackend) if backend_is_local else object()
+
+    assert provider.uses_thread_data_mounts is expected
+
 
 # ── ensure_thread_dirs ───────────────────────────────────────────────────────
 
@@ -175,8 +219,9 @@ def test_get_user_skill_mounts_mounts_only_global_integrations(tmp_path, monkeyp
 
     assert set(alice) == {"/mnt/skills/integrations"}
     assert set(bob) == {"/mnt/skills/integrations"}
-    assert alice["/mnt/skills/integrations"] == bob["/mnt/skills/integrations"]
-    assert alice["/mnt/skills/integrations"] == str(tmp_path / "home" / "integrations" / "skills")
+    assert alice["/mnt/skills/integrations"] != bob["/mnt/skills/integrations"]
+    assert alice["/mnt/skills/integrations"] == str(tmp_path / "home" / "users" / "alice" / "skills_view" / "integrations")
+    assert bob["/mnt/skills/integrations"] == str(tmp_path / "home" / "users" / "bob" / "skills_view" / "integrations")
 
 
 def test_get_extra_mounts_provisioner_payload_has_unique_container_paths(tmp_path, monkeypatch, provisioner_module):
@@ -199,7 +244,7 @@ def test_get_extra_mounts_provisioner_payload_has_unique_container_paths(tmp_pat
     monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
     monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=home))
     monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: "default")
-    monkeypatch.setattr(aio_mod, "user_should_see_legacy_skills", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(remote_backend, "user_should_see_legacy_skills", lambda *_args, **_kwargs: False)
 
     provider = _make_provider(tmp_path)
     mounts = provider._get_extra_mounts("thread-1", user_id="alice")
@@ -482,7 +527,10 @@ async def test_acquire_internal_async_offloads_cached_reuse_health_check(tmp_pat
     sandbox_id = await provider._acquire_internal_async("thread-cached-async", user_id="default")
 
     assert sandbox_id == "sandbox-cached-async"
-    assert to_thread_calls == [(provider._reuse_in_process_sandbox, ("thread-cached-async",))]
+    assert to_thread_calls == [
+        (provider._ensure_skills_projection, ("default",)),
+        (provider._reuse_in_process_sandbox, ("thread-cached-async",)),
+    ]
 
 
 def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
@@ -504,7 +552,7 @@ def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
         return _Response()
 
     monkeypatch.setattr(remote_mod.requests, "post", _post)
-    monkeypatch.setattr(remote_mod, "user_should_see_legacy_skills", lambda user_id: True)
+    monkeypatch.setattr(remote_mod, "user_should_see_legacy_skills", lambda _user_id: True)
 
     try:
         backend.create("thread-42", "sandbox-42")
@@ -518,6 +566,7 @@ def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
         "user_id": "user-7",
         "include_legacy_skills": True,
         "provision_lark_cli_runtime": False,
+        "provision_lark_cli_broker": False,
     }
 
 
@@ -540,7 +589,7 @@ def test_remote_backend_create_prefers_explicit_user_id(monkeypatch):
 
     monkeypatch.setattr(remote_mod.requests, "post", _post)
     monkeypatch.setattr(remote_mod, "get_effective_user_id", lambda: "default")
-    monkeypatch.setattr(remote_mod, "user_should_see_legacy_skills", lambda user_id: False)
+    monkeypatch.setattr(remote_mod, "user_should_see_legacy_skills", lambda _user_id: False)
 
     backend.create("thread-42", "sandbox-42", user_id="ou-user")
 
@@ -562,18 +611,52 @@ def test_create_sandbox_requests_runtime_when_lark_installed(tmp_path, monkeypat
 
     captured: dict = {}
 
-    def _create(thread_id, sandbox_id, *, extra_mounts=None, user_id=None, provision_lark_cli_runtime=False):
+    def _create(thread_id, sandbox_id, *, extra_mounts=None, user_id=None, provision_lark_cli_runtime=False, provision_lark_cli_broker=False):
         captured["provision_lark_cli_runtime"] = provision_lark_cli_runtime
+        captured["provision_lark_cli_broker"] = provision_lark_cli_broker
         return aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url="http://sandbox")
 
     provider._backend = SimpleNamespace(create=_create, destroy=MagicMock(), discover=MagicMock(return_value=None))
     monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda *_a, **_k: True)
     monkeypatch.setattr(provider, "_get_extra_mounts", lambda *_a, **_k: [])
     monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_integration_active", staticmethod(lambda user_id=None: True))
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_broker_active", staticmethod(lambda user_id=None: False))
     monkeypatch.setattr(provider, "_register_created_sandbox", lambda *a, **k: "sandbox-lark")
 
     provider._create_sandbox("thread-lark", "sandbox-lark", user_id="alice")
     assert captured["provision_lark_cli_runtime"] is True
+    assert captured["provision_lark_cli_broker"] is False
+
+
+def test_create_sandbox_requests_broker_when_active(tmp_path, monkeypatch):
+    """Broker mode (Pattern B) is requested when the provisioner reports it."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._config = {"replicas": 3}
+    provider._thread_locks = {}
+    provider._warm_pool = {}
+    provider._sandbox_infos = {}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {}
+    provider._lock = aio_mod.threading.Lock()
+
+    captured: dict = {}
+
+    def _create(thread_id, sandbox_id, *, extra_mounts=None, user_id=None, provision_lark_cli_runtime=False, provision_lark_cli_broker=False):
+        captured["provision_lark_cli_runtime"] = provision_lark_cli_runtime
+        captured["provision_lark_cli_broker"] = provision_lark_cli_broker
+        return aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url="http://sandbox")
+
+    provider._backend = SimpleNamespace(create=_create, destroy=MagicMock(), discover=MagicMock(return_value=None))
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(provider, "_get_extra_mounts", lambda *_a, **_k: [])
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_integration_active", staticmethod(lambda user_id=None: True))
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_broker_active", staticmethod(lambda user_id=None: True))
+    monkeypatch.setattr(provider, "_register_created_sandbox", lambda *a, **k: "sandbox-broker")
+
+    provider._create_sandbox("thread-broker", "sandbox-broker", user_id="alice")
+    assert captured["provision_lark_cli_runtime"] is True
+    assert captured["provision_lark_cli_broker"] is True
 
 
 def test_create_sandbox_skips_runtime_when_lark_absent(tmp_path, monkeypatch):
@@ -590,18 +673,21 @@ def test_create_sandbox_skips_runtime_when_lark_absent(tmp_path, monkeypatch):
 
     captured: dict = {}
 
-    def _create(thread_id, sandbox_id, *, extra_mounts=None, user_id=None, provision_lark_cli_runtime=False):
+    def _create(thread_id, sandbox_id, *, extra_mounts=None, user_id=None, provision_lark_cli_runtime=False, provision_lark_cli_broker=False):
         captured["provision_lark_cli_runtime"] = provision_lark_cli_runtime
+        captured["provision_lark_cli_broker"] = provision_lark_cli_broker
         return aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url="http://sandbox")
 
     provider._backend = SimpleNamespace(create=_create, destroy=MagicMock(), discover=MagicMock(return_value=None))
     monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda *_a, **_k: True)
     monkeypatch.setattr(provider, "_get_extra_mounts", lambda *_a, **_k: [])
     monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_integration_active", staticmethod(lambda user_id=None: False))
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_lark_broker_active", staticmethod(lambda user_id=None: False))
     monkeypatch.setattr(provider, "_register_created_sandbox", lambda *a, **k: "sandbox-nolark")
 
     provider._create_sandbox("thread-nolark", "sandbox-nolark", user_id="alice")
     assert captured["provision_lark_cli_runtime"] is False
+    assert captured["provision_lark_cli_broker"] is False
 
 
 # ── Sandbox client teardown (#2872) ──────────────────────────────────────────
@@ -990,3 +1076,222 @@ def test_aio_forced_collision_never_overwrites_active_tenant(
     assert len(create_calls) == 1
     assert provider.acquire("thread-a", user_id="user-a") == sandbox_id
     assert provider._sandbox_infos[sandbox_id] is info_a
+
+
+# --- #4248 regression: readiness-timeout destroy ownership ---
+
+
+def _make_unready_destroy_provider(tmp_path, *, sandbox_id, base_url, monkeypatch, aio_mod):
+    """Provider wired so ``_create_sandbox`` reaches the readiness-timeout branch.
+
+    ``wait_for_sandbox_ready`` always returns False; the backend records what the
+    destroy path did. Mirrors the fixtures used by the warm-replica eviction
+    test, minus the warm pool.
+    """
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._config = {"replicas": 3}
+    provider._thread_locks = {}
+    provider._warm_pool = {}
+    provider._sandbox_infos = {}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {}
+    provider._active_sandbox_identity = {}
+    provider._warm_pool_identity = {}
+    unready_info = aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url=base_url)
+    provider._backend = SimpleNamespace(
+        create=MagicMock(return_value=unready_info),
+        destroy=MagicMock(),
+    )
+    monkeypatch.setattr(
+        aio_mod.AioSandboxProvider,
+        "_get_extra_mounts",
+        lambda _self, _thread_id, *, user_id=None: [],
+    )
+    return provider, unready_info
+
+
+def test_create_sandbox_claims_ownership_before_readiness_timeout_destroy(tmp_path, monkeypatch):
+    """#4248: a readiness-timeout destroy must run under a `del:` teardown lease.
+
+    Before #4248 the unready container was reaped with a bare ``destroy`` call.
+    Ownership is published by ``_register_created_sandbox`` only after the
+    readiness gate, so for up to 60s the container ran unowned and a peer could
+    adopt it; the subsequent stop landed on whatever turn the peer had handed it.
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, unready_info = _make_unready_destroy_provider(
+        tmp_path,
+        sandbox_id="unready",
+        base_url="http://unready",
+        monkeypatch=monkeypatch,
+        aio_mod=aio_mod,
+    )
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda _url, *, timeout=60: False)
+
+    # The heartbeat releases the teardown lease on exit, so the destroy call is
+    # the only place we can observe the `del:` state. Snapshot the lease at
+    # the instant destroy runs.
+    destroy_snapshots: list = []
+
+    def destroy_spy(info):
+        destroy_snapshots.append(provider._ownership._leases.get(info.sandbox_id))
+
+    provider._backend.destroy.side_effect = destroy_spy
+
+    with pytest.raises(RuntimeError, match="failed to become ready"):
+        provider._create_sandbox("thread-4248", "unready", user_id="user-4248")
+
+    provider._backend.destroy.assert_called_once_with(unready_info)
+    assert destroy_snapshots, "destroy must run inside the held teardown lease"
+    lease = destroy_snapshots[0]
+    assert lease is not None, "teardown lease must be held while destroy runs"
+    assert lease.owner_id == provider._owner_id
+    assert lease.destroying is True, "destroy must run under a `del:` teardown lease"
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_async_claims_ownership_before_readiness_timeout_destroy(tmp_path, monkeypatch):
+    """#4248 (async path): same teardown-lease guard on the async readiness branch."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, unready_info = _make_unready_destroy_provider(
+        tmp_path,
+        sandbox_id="unready-async",
+        base_url="http://unready-async",
+        monkeypatch=monkeypatch,
+        aio_mod=aio_mod,
+    )
+
+    async def fake_wait_async(_url, *, timeout=60, poll_interval=1.0):
+        return False
+
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready_async", fake_wait_async)
+    monkeypatch.setattr(
+        aio_mod,
+        "wait_for_sandbox_ready",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("sync readiness should not be used")),
+    )
+
+    destroy_snapshots: list = []
+
+    def destroy_spy(info):
+        destroy_snapshots.append(provider._ownership._leases.get(info.sandbox_id))
+
+    provider._backend.destroy.side_effect = destroy_spy
+
+    with pytest.raises(RuntimeError, match="failed to become ready"):
+        await provider._create_sandbox_async("thread-4248-async", "unready-async", user_id="user-4248-async")
+
+    provider._backend.destroy.assert_called_once_with(unready_info)
+    assert destroy_snapshots, "destroy must run inside the held teardown lease"
+    lease = destroy_snapshots[0]
+    assert lease is not None
+    assert lease.owner_id == provider._owner_id
+    assert lease.destroying is True, "destroy must run under a `del:` teardown lease"
+
+
+def test_create_sandbox_skips_destroy_when_unready_sandbox_owned_by_peer(tmp_path, monkeypatch):
+    """#4248 fail-closed: if a peer already owns the unready container, do not stop it.
+
+    The lease refuses our teardown claim, so the container is left for the peer
+    to reap via its own reconciliation. Stopping it anyway would be the
+    cross-instance kill this guard exists to prevent.
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, unready_info = _make_unready_destroy_provider(
+        tmp_path,
+        sandbox_id="peer-owned",
+        base_url="http://peer-owned",
+        monkeypatch=monkeypatch,
+        aio_mod=aio_mod,
+    )
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda _url, *, timeout=60: False)
+
+    # Every claim refuses: peer holds the lease (or the store cannot answer).
+    provider._ownership.claim = lambda _sid, *, for_destroy=False: False
+
+    with pytest.raises(RuntimeError, match="failed to become ready"):
+        provider._create_sandbox("thread-peer", "peer-owned", user_id="user-peer")
+
+    provider._backend.destroy.assert_not_called()
+
+
+def test_reconcile_does_not_adopt_a_container_whose_unready_teardown_is_reserved(tmp_path, monkeypatch):
+    """#4248 follow-up: the readiness-timeout destroy must hold the local
+    reservation, not just the cross-instance claim.
+
+    The claim succeeds against our own lease by design, so without
+    ``_reserve_local_teardown`` there is a window — readiness failed, claim not
+    yet written — in which the idle checker's ``_reconcile_orphans`` sees the
+    container running, untracked, and past its recovery grace, and adopts it
+    into ``_warm_pool``. The claim then still succeeds (the lease is ours) and
+    the stop lands on an entry this instance has just adopted, leaving a dead
+    warm entry for the next reclaim to hand out. This is the same interleaving
+    shape as ``test_reconcile_does_not_adopt_a_container_this_instance_is_tearing_down``
+    in ``test_sandbox_orphan_reconciliation.py``.
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, unready_info = _make_unready_destroy_provider(
+        tmp_path,
+        sandbox_id="unready-race",
+        base_url="http://unready-race",
+        monkeypatch=monkeypatch,
+        aio_mod=aio_mod,
+    )
+    provider._unowned_since = {}
+    provider._backend.list_running = MagicMock(return_value=[unready_info])
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda _url, *, timeout=60: False)
+
+    # Park the destroy thread after it has reserved the local teardown but
+    # before the `del:` claim lands — the exact window reconcile would adopt in.
+    at_claim, let_claim = threading.Event(), threading.Event()
+    real_claim = provider._claim_ownership
+
+    def gated_claim(sandbox_id, *, for_destroy=False):
+        if for_destroy:
+            at_claim.set()
+            assert let_claim.wait(timeout=5)
+        return real_claim(sandbox_id, for_destroy=for_destroy)
+
+    provider._claim_ownership = gated_claim
+    reaper = threading.Thread(
+        target=lambda: provider._destroy_unready_sandbox("unready-race", unready_info),
+        daemon=True,
+    )
+    reaper.start()
+    try:
+        assert at_claim.wait(timeout=5), "the unready destroy never reached its claim"
+        # Reserved locally, still running, untracked, and the `del:` marker is
+        # not written yet — exactly the shape reconcile would have adopted
+        # before the reservation wrapped this path.
+        provider._reconcile_orphans()
+        assert "unready-race" not in provider._warm_pool, "reconcile adopted a container this instance is tearing down"
+    finally:
+        let_claim.set()
+        reaper.join(timeout=5)
+
+    # The reservation is released once the stop returns, and the destroy did run.
+    provider._backend.destroy.assert_called_once_with(unready_info)
+    assert provider._local_teardown == set(), "a teardown reservation outlived the stop it guarded"
+
+
+def test_reconcile_adopts_unready_container_when_no_teardown_is_in_flight(tmp_path, monkeypatch):
+    """Mirror of the interleaving test: with no destroy running, the same
+    not-yet-registered container *is* adoptable, so the guard above cannot
+    over-block legitimate reconciliation of a container whose creator crashed
+    before the readiness gate.
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, unready_info = _make_unready_destroy_provider(
+        tmp_path,
+        sandbox_id="adoptable",
+        base_url="http://adoptable",
+        monkeypatch=monkeypatch,
+        aio_mod=aio_mod,
+    )
+    provider._unowned_since = {}
+    provider._backend.list_running = MagicMock(return_value=[unready_info])
+
+    provider._reconcile_orphans()
+
+    assert "adoptable" in provider._warm_pool, "reconcile must still adopt a genuinely unowned container"

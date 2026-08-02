@@ -3,6 +3,9 @@
 import json
 import logging
 import os
+import stat
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,6 +14,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from deerflow.config.runtime_paths import existing_project_file
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_mcp_transport_alias(data: Any) -> Any:
+    """Promote MCP-spec ``transport`` to ``type`` when ``type`` is absent."""
+    if isinstance(data, dict):
+        transport = data.get("transport")
+        if transport and not data.get("type"):
+            return {**data, "type": transport}
+    return data
 
 
 class McpRoutingConfig(BaseModel):
@@ -86,6 +98,10 @@ class McpServerConfig(BaseModel):
     description: str = Field(default="", description="Human-readable description of what this MCP server provides")
     routing: McpRoutingConfig = Field(default_factory=McpRoutingConfig, description="Soft routing hints for tools from this MCP server")
     tools: dict[str, McpToolOverride] = Field(default_factory=dict, description="Per-original-tool MCP configuration overrides")
+    tool_name_prefix: bool = Field(
+        default=True,
+        description="Whether to prefix discovered tool names with the MCP server name to avoid cross-server collisions",
+    )
     tool_call_timeout: float | None = Field(
         default=None,
         description="Timeout in seconds for individual stdio MCP tool calls. HTTP/SSE servers use transport-level timeouts. None means no timeout.",
@@ -104,11 +120,7 @@ class McpServerConfig(BaseModel):
         ``stdio`` (the default). This validator normalizes the two so either
         spelling works, with ``type`` taking precedence when both are provided.
         """
-        if isinstance(data, dict):
-            transport = data.get("transport")
-            if transport and not data.get("type"):
-                data = {**data, "type": transport}
-        return data
+        return normalize_mcp_transport_alias(data)
 
 
 def resolve_effective_mcp_routing(server_config: McpServerConfig | None, original_tool_name: str) -> dict[str, Any]:
@@ -322,6 +334,70 @@ class ExtensionsConfig(BaseModel):
 _extensions_config: ExtensionsConfig | None = None
 
 
+def _fsync_directory_best_effort(directory: Path) -> None:
+    """Persist a directory entry update where the platform supports it."""
+    if os.name == "nt":
+        return
+
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        logger.debug("Could not fsync extensions config directory: %s", directory, exc_info=True)
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            logger.debug("Could not close extensions config directory: %s", directory, exc_info=True)
+
+
+def atomic_write_extensions_config(path: Path, data: dict[str, Any]) -> None:
+    """Write extensions config without exposing a truncated or partial file."""
+    path = Path(path)
+    target_path = path.resolve(strict=False) if path.is_symlink() else path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_mode: int | None = None
+    try:
+        existing_mode = stat.S_IMODE(target_path.stat().st_mode)
+    except FileNotFoundError:
+        pass
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_path.parent,
+            prefix=f".{target_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(data, temporary_file, indent=2)
+            if existing_mode is not None:
+                temporary_path.chmod(existing_mode)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        os.replace(temporary_path, target_path)
+        _fsync_directory_best_effort(target_path.parent)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove temporary extensions config file: %s",
+                    temporary_path,
+                    exc_info=True,
+                )
+
+
 def get_extensions_config() -> ExtensionsConfig:
     """Get the extensions config instance.
 
@@ -335,6 +411,25 @@ def get_extensions_config() -> ExtensionsConfig:
     if _extensions_config is None:
         _extensions_config = ExtensionsConfig.from_file()
     return _extensions_config
+
+
+#: Serializes read-modify-write cycles on ``extensions_config.json`` across every
+#: writer. Both the skills router (skill enable/disable) and the MCP router
+#: (server config updates) read this file, merge a change and write it back.
+#: While each RMW ran inline on the event loop they were implicitly serialized;
+#: once a writer offloads its RMW to a worker thread the loop is free to
+#: interleave the other writer inside the read->write window, and the second
+#: write silently drops the first one's change.
+#:
+#: This is a ``threading.Lock`` rather than an ``asyncio.Lock``, and it must be
+#: acquired *inside* the worker that performs the RMW. An asyncio lock held
+#: around ``await asyncio.to_thread(...)`` protects only the awaiting task: if
+#: that task is cancelled the context manager releases immediately while the
+#: worker thread keeps writing, letting a second writer in. Owning the lock from
+#: the worker keeps it held until the write and reload actually finish. It also
+#: has no event-loop affinity, so writers running on different loops still
+#: exclude each other.
+extensions_config_write_lock = threading.Lock()
 
 
 def reload_extensions_config(config_path: str | None = None) -> ExtensionsConfig:

@@ -410,18 +410,66 @@ def test_delete_thread_route_rejects_invalid_thread_id(tmp_path):
     assert response.status_code == 404
 
 
-def test_delete_thread_route_returns_422_for_route_safe_invalid_id(tmp_path):
-    paths = Paths(tmp_path)
+def test_delete_thread_route_cleans_legacy_metadata_without_resolving_unsafe_path():
+    app, store, _checkpointer = _build_thread_app()
+    legacy_thread_id = "legacy.thread"
 
-    app = make_authed_test_app()
-    app.include_router(threads.router)
+    asyncio.run(
+        store.aput(
+            THREADS_NS,
+            legacy_thread_id,
+            {
+                "thread_id": legacy_thread_id,
+                "status": "idle",
+                "created_at": "",
+                "updated_at": "",
+                "metadata": {},
+            },
+        )
+    )
 
-    with patch("app.gateway.routers.threads.get_paths", return_value=paths):
-        with TestClient(app) as client:
-            response = client.delete("/api/threads/thread.with.dot")
+    with (
+        patch(
+            "app.gateway.routers.threads._delete_thread_data",
+            side_effect=AssertionError("legacy thread ID must not reach filesystem cleanup"),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.delete(f"/api/threads/{legacy_thread_id}")
+
+    assert response.status_code == 200
+    assert "Skipped local data cleanup" in response.json()["message"]
+    assert asyncio.run(store.aget(THREADS_NS, legacy_thread_id)) is None
+
+
+def test_legacy_thread_metadata_mutation_is_rejected():
+    app, store, _checkpointer = _build_thread_app()
+    legacy_thread_id = "legacy.thread"
+
+    asyncio.run(
+        store.aput(
+            THREADS_NS,
+            legacy_thread_id,
+            {
+                "thread_id": legacy_thread_id,
+                "status": "idle",
+                "created_at": "",
+                "updated_at": "",
+                "metadata": {"original": True},
+            },
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.patch(
+            f"/api/threads/{legacy_thread_id}",
+            json={"metadata": {"mutated": True}},
+        )
 
     assert response.status_code == 422
-    assert "Invalid thread_id" in response.json()["detail"]
+    record = asyncio.run(store.aget(THREADS_NS, legacy_thread_id))
+    assert record is not None
+    assert record.value["metadata"] == {"original": True}
 
 
 def test_delete_thread_data_returns_generic_500_error(tmp_path):
@@ -488,6 +536,31 @@ def test_create_thread_returns_iso_timestamps() -> None:
     assert _ISO_TIMESTAMP_RE.match(body["created_at"]), body["created_at"]
     assert _ISO_TIMESTAMP_RE.match(body["updated_at"]), body["updated_at"]
     assert body["created_at"] == body["updated_at"]
+
+
+@pytest.mark.parametrize(
+    "thread_id",
+    ["", "thread.with.dot", "../escape", "x" * 65],
+)
+def test_create_thread_rejects_invalid_explicit_thread_id_before_persistence(thread_id: str) -> None:
+    app, store, checkpointer = _build_thread_app()
+
+    with TestClient(app) as client:
+        response = client.post("/api/threads", json={"thread_id": thread_id})
+
+    assert response.status_code == 422
+    assert asyncio.run(store.asearch(THREADS_NS)) == []
+    assert not checkpointer.storage
+
+
+def test_create_thread_preserves_valid_explicit_thread_id() -> None:
+    app, _store, _checkpointer = _build_thread_app()
+
+    with TestClient(app) as client:
+        response = client.post("/api/threads", json={"thread_id": "caller_thread-1"})
+
+    assert response.status_code == 200
+    assert response.json()["thread_id"] == "caller_thread-1"
 
 
 def test_create_thread_returns_existing_when_insert_loses_race() -> None:
@@ -1241,7 +1314,67 @@ def test_get_thread_history_associates_tool_messages_from_checkpoint_turn() -> N
     history_messages = response.json()[0]["values"]["messages"]
     assert [message.get("run_id") for message in history_messages[1:]] == ["run-1", "run-1", "run-1"]
 
-    assert [message["additional_kwargs"]["turn_duration"] for message in history_messages if message["type"] == "ai"] == [4, 4]
+    # #4152: turn_duration belongs to the run, not to every AI message in it —
+    # only the run's last AI message ("Done") gets stamped, not the
+    # tool-calling one that precedes it.
+    ai_messages = [message for message in history_messages if message["type"] == "ai"]
+    assert len(ai_messages) == 2
+    assert "turn_duration" not in (ai_messages[0].get("additional_kwargs") or {})
+    assert ai_messages[1]["additional_kwargs"]["turn_duration"] == 4
+
+
+def test_get_thread_history_fast_path_skips_runs_already_in_checkpoint_metadata() -> None:
+    """A checkpoint can carry metadata for some runs but not others (e.g. the
+    latest run just completed and hasn't been persisted yet). Only the
+    missing run should trigger the event-store/run-manager correlation
+    fallback; the already-migrated run must not re-query it."""
+    app, _store, checkpointer = _build_thread_app()
+    thread_id = "history-partial-migration"
+    messages = [
+        HumanMessage(id="human-1", content="First", additional_kwargs={"run_id": "run-migrated"}),
+        AIMessage(id="ai-1", content="First answer"),
+        HumanMessage(id="human-2", content="Second", additional_kwargs={"run_id": "run-pending"}),
+        AIMessage(id="ai-2", content="Second answer"),
+    ]
+    asyncio.run(
+        _write_checkpoint(
+            checkpointer,
+            thread_id,
+            "checkpoint-partial",
+            messages,
+            step=1,
+            metadata={"run_durations": {"run-migrated": 4}},
+        )
+    )
+
+    async def list_by_thread(_: str) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                run_id="run-pending",
+                created_at="2026-07-05T00:00:00+00:00",
+                updated_at="2026-07-05T00:00:06+00:00",
+            ),
+        ]
+
+    list_messages_calls: list[str] = []
+
+    async def list_messages(thread: str, *, limit: int) -> list[dict]:
+        list_messages_calls.append(thread)
+        return []
+
+    app.state.run_manager = SimpleNamespace(list_by_thread=list_by_thread)
+    app.state.run_event_store = SimpleNamespace(list_messages=list_messages)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/threads/{thread_id}/history", json={"limit": 10})
+
+    assert response.status_code == 200, response.text
+    history_messages = response.json()[0]["values"]["messages"]
+    assert history_messages[1]["additional_kwargs"]["turn_duration"] == 4
+    assert history_messages[3]["additional_kwargs"]["turn_duration"] == 6
+    # The fallback still runs (run-pending was missing), but it is the only
+    # reason it ran — proven by it firing exactly once, not skipped entirely.
+    assert list_messages_calls == [thread_id]
 
 
 def test_get_thread_history_backfills_legacy_durations_with_exact_event_run_id() -> None:
@@ -1291,11 +1424,56 @@ def test_get_thread_history_backfills_legacy_durations_with_exact_event_run_id()
     assert latest.metadata["run_durations"] == {"boundary-run": 3, "exact-run": 7}
 
 
-def test_ai_message_lacks_duration_only_for_unannotated_ai_messages() -> None:
-    assert threads._ai_message_lacks_duration({"type": "ai"})
-    assert threads._ai_message_lacks_duration({"type": "ai", "additional_kwargs": []})
-    assert not threads._ai_message_lacks_duration({"type": "tool"})
-    assert not threads._ai_message_lacks_duration({"type": "ai", "additional_kwargs": {"turn_duration": 0}})
+def test_get_thread_history_injects_turn_duration_once_per_run() -> None:
+    """#4152: ``/history`` replays checkpoint messages on reload, so it must
+    stamp ``turn_duration`` the same way the message endpoints do — once per
+    run, on that run's last AI message — even when a run produced several AI
+    messages."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from deerflow.runtime import RunRecord
+
+    def _run(run_id: str, seconds: int) -> RunRecord:
+        return RunRecord(
+            run_id=run_id,
+            thread_id="history-durations",
+            assistant_id=None,
+            status="success",
+            on_disconnect="cancel",
+            created_at="2026-06-20T10:00:00Z",
+            updated_at=f"2026-06-20T10:00:{seconds:02d}Z",
+        )
+
+    app, _store, checkpointer = _build_thread_app()
+    thread_id = "history-durations"
+
+    messages = [
+        HumanMessage(id="human-1", content="Hello", additional_kwargs={"run_id": "run-1"}),
+        AIMessage(id="ai-1a", content="Before tools"),
+        AIMessage(id="ai-1b", content="Final answer"),
+        HumanMessage(id="human-2", content="Again", additional_kwargs={"run_id": "run-2"}),
+        AIMessage(id="ai-2", content="Second answer"),
+    ]
+    asyncio.run(_write_checkpoint(checkpointer, thread_id, "0001", messages, step=1))
+
+    run_manager = AsyncMock()
+    run_manager.list_by_thread = AsyncMock(return_value=[_run("run-1", 5), _run("run-2", 9)])
+    event_store = MagicMock()
+    event_store.list_messages = AsyncMock(return_value=[])
+    app.state.run_manager = run_manager
+    app.state.run_event_store = event_store
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/threads/{thread_id}/history", json={"limit": 10})
+
+    assert response.status_code == 200, response.text
+    replayed = response.json()[0]["values"]["messages"]
+
+    assert "turn_duration" not in (replayed[0].get("additional_kwargs") or {})
+    assert "turn_duration" not in (replayed[1].get("additional_kwargs") or {})
+    assert replayed[2]["additional_kwargs"]["turn_duration"] == 5
+    assert "turn_duration" not in (replayed[3].get("additional_kwargs") or {})
+    assert replayed[4]["additional_kwargs"]["turn_duration"] == 9
 
 
 # ── branch threads from completed assistant turns ─────────────────────────────

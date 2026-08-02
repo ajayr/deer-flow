@@ -34,6 +34,7 @@ from app.gateway.utils import sanitize_log_param
 from deerflow.agents.middlewares.dynamic_context_middleware import _DYNAMIC_CONTEXT_REMINDER_KEY, _REMINDER_DATE_KEY
 from deerflow.agents.middlewares.view_image_middleware import _IMAGE_CONTEXT_MESSAGE_MARKER_KEY
 from deerflow.config.app_config import get_app_config
+from deerflow.config.database_config import resolve_checkpoint_graph_cache_max
 from deerflow.runtime import (
     END_SENTINEL,
     HEARTBEAT_SENTINEL,
@@ -60,11 +61,17 @@ from deerflow.runtime.checkpoint_mode import (
 )
 from deerflow.runtime.checkpoint_state import graph_state_schema
 from deerflow.runtime.goal import goal_thread_lock
+from deerflow.runtime.journal import build_checkpoint_history_seed_events
 from deerflow.runtime.runs.naming import resolve_root_run_name
-from deerflow.runtime.secret_context import redact_config_secrets
+from deerflow.runtime.secret_context import (
+    LegacyRunMetadataSecretError,
+    redact_config_secrets,
+    validate_run_metadata_secrets,
+)
 from deerflow.runtime.stream_modes import normalize_stream_modes
 from deerflow.runtime.user_context import reset_current_user, set_current_user
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY
+from deerflow.utils.thread_id import validate_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -303,12 +310,21 @@ _CONTEXT_INTERNAL_CALLER_KEYS: frozenset[str] = frozenset({"non_interactive"})
 
 # Server-owned authorization identity fields. These must never be accepted from
 # client-supplied ``body.config.context`` or ``body.config.configurable``. They
-# are either produced by Gateway auth state or admitted from a separately
-# authenticated internal request channel.
-#   ``is_internal``       — derived from ``request.state.auth_source``
-#   ``authz_attributes`` — Phase 1A has no Gateway-side producer; always cleared.
-#   ``channel_user_id``  — accepted only from trusted internal ``body.context``.
-_SERVER_OWNED_AUTHZ_CONTEXT_KEYS: frozenset[str] = frozenset({"is_internal", "authz_attributes", "channel_user_id"})
+# are either produced by Gateway auth state, admitted from a separately
+# authenticated internal request channel, or reserved for LangGraph Server.
+#   ``is_internal``             — derived from ``request.state.auth_source``
+#   ``authz_attributes``        — Phase 1A has no Gateway-side producer; cleared.
+#   ``channel_user_id``         — accepted only from trusted internal context.
+#   ``langgraph_auth_user*``    — populated only by LangGraph Server auth.
+_SERVER_OWNED_AUTHZ_CONTEXT_KEYS: frozenset[str] = frozenset(
+    {
+        "is_internal",
+        "authz_attributes",
+        "channel_user_id",
+        "langgraph_auth_user",
+        "langgraph_auth_user_id",
+    }
+)
 
 # Keys forwarded from ``body.context`` into ``config['context']`` ONLY (the
 # runtime context that becomes ``ToolRuntime.context`` / ``runtime.context``),
@@ -677,23 +693,35 @@ def build_checkpoint_state_mutation_accessor(
 # Cache of factory-built accessor graphs. Accessor operations (aget_state /
 # aupdate_state) never execute graph nodes or middleware, so per-request
 # variations (user, model, skills) cannot affect materialization semantics;
-# the compiled graph is stable per (assistant_id, mode, app_config). The
+# the compiled graph is stable per (assistant_id, mode, snapshot_frequency,
+# app_config). The
 # factory and app_config identities are re-validated on every call so patched
 # factories take effect immediately and a config.yaml hot-reload (which
 # rebuilds the AppConfig object) never serves a stale compiled graph — the
 # cached reference keeps the old config alive, so id-reuse cannot produce a
-# false hit. Bounded: cleared when too many distinct assistants appear.
+# false hit. Bounded: cleared when too many distinct assistants appear. The
+# cap is configurable (database.checkpoint_graph_cache.accessor_graph_max)
+# and re-read on every eviction check, so a hot-reload takes effect without
+# a restart.
 _STATE_ACCESSOR_GRAPH_CACHE_MAX = 64
-_state_accessor_graph_cache: dict[tuple[str | None, str], tuple[Any, Any, Any]] = {}
+_state_accessor_graph_cache: dict[tuple[str | None, str, int | None], tuple[Any, Any, Any]] = {}
 
 
-def _state_accessor_graph(agent_factory: Any, assistant_id: str | None, mode: str, config: dict[str, Any]) -> Any:
+def _accessor_graph_cache_max(app_config: Any) -> int:
+    return resolve_checkpoint_graph_cache_max(
+        getattr(app_config, "database", None),
+        "accessor_graph_max",
+        _STATE_ACCESSOR_GRAPH_CACHE_MAX,
+    )
+
+
+def _state_accessor_graph(agent_factory: Any, assistant_id: str | None, mode: str, snapshot_frequency: int | None, config: dict[str, Any]) -> Any:
     app_config = (config.get("context") or {}).get("app_config")
-    key = (assistant_id, mode)
+    key = (assistant_id, mode, snapshot_frequency)
     cached = _state_accessor_graph_cache.get(key)
     if cached is not None and cached[0] is agent_factory and cached[1] is app_config:
         return cached[2]
-    if len(_state_accessor_graph_cache) >= _STATE_ACCESSOR_GRAPH_CACHE_MAX:
+    if len(_state_accessor_graph_cache) >= _accessor_graph_cache_max(app_config):
         _state_accessor_graph_cache.clear()
     graph = agent_factory(config=config)
     _state_accessor_graph_cache[key] = (agent_factory, app_config, graph)
@@ -798,7 +826,7 @@ def build_checkpoint_state_accessor(
 
     agent_factory = resolve_agent_factory(assistant_id)
     try:
-        graph = _state_accessor_graph(agent_factory, assistant_id, ctx.checkpoint_channel_mode, config)
+        graph = _state_accessor_graph(agent_factory, assistant_id, ctx.checkpoint_channel_mode, getattr(ctx, "checkpoint_snapshot_frequency", None), config)
     except Exception:
         if ctx.checkpoint_channel_mode != "full":
             # Delta materialization needs the graph's channel table; there is
@@ -957,6 +985,63 @@ async def apply_checkpoint_to_run_config(
         configurable["checkpoint_map"] = checkpoint_map
 
 
+async def ensure_checkpoint_history_seeded(
+    request: Request,
+    *,
+    thread_id: str,
+    assistant_id: str | None,
+) -> None:
+    """Backfill an empty run-event feed from an existing checkpoint head.
+
+    No-op unless the feed is empty AND a checkpoint head with messages
+    exists — i.e. a legacy checkpoint-only thread facing its first journaled
+    run. This is a migration shim: remove it once pre-journal threads are no
+    longer a supported upgrade source. The info log on a successful seed is
+    the observability hook for that decision — when it stops appearing, the
+    shim is dead.
+    """
+    event_store = request.app.state.run_event_store
+    # The emptiness check is deliberately thread-scoped, never user-scoped:
+    # seed rows may be stamped with a different principal (NULL for ownerless
+    # seeds, or another user on a shared NULL-owner thread), so a user-scoped
+    # query would miss them and re-seed a duplicate history per principal.
+    # Passing user_id=None also opts out of AUTO resolution explicitly, which
+    # would raise when no user contextvar is set (e.g. the scheduler launch
+    # path for ownerless internal tasks).
+    if await event_store.list_messages(thread_id, limit=1, user_id=None):
+        return
+
+    checkpoint_config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": "",
+        }
+    }
+    if await get_checkpointer(request).aget_tuple(checkpoint_config) is None:
+        return
+
+    accessor, config = build_checkpoint_state_accessor(
+        request,
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+    )
+    snapshot = await accessor.aget(config)
+    values = getattr(snapshot, "values", None)
+    messages = values.get("messages") if isinstance(values, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return
+
+    events = build_checkpoint_history_seed_events(
+        messages,
+        thread_id=thread_id,
+        run_id_prefix=f"checkpoint-seed-{thread_id}",
+    )
+    if not events:
+        return
+    await event_store.put_batch(events)
+    logger.info("Seeded %d checkpoint-history events for thread %s", len(events), thread_id)
+
+
 # ---------------------------------------------------------------------------
 # Run lifecycle
 # ---------------------------------------------------------------------------
@@ -978,6 +1063,19 @@ async def start_run(
     request : Request
         FastAPI request — used to retrieve singletons from ``app.state``.
     """
+    try:
+        validate_thread_id(thread_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    body_config = getattr(body, "config", None)
+    config_metadata = body_config.get("metadata") if isinstance(body_config, dict) else None
+    try:
+        validate_run_metadata_secrets(getattr(body, "metadata", None))
+        validate_run_metadata_secrets(config_metadata)
+    except LegacyRunMetadataSecretError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     stream_modes = normalize_stream_modes(body.stream_mode)
     bridge = get_stream_bridge(request)
     run_mgr = get_run_manager(request)
@@ -1122,6 +1220,11 @@ async def start_run(
 
         try:
             async with goal_thread_lock(thread_id):
+                await ensure_checkpoint_history_seeded(
+                    request,
+                    thread_id=thread_id,
+                    assistant_id=body.assistant_id,
+                )
                 record = await run_mgr.create_or_reject(
                     thread_id,
                     body.assistant_id,
@@ -1271,10 +1374,10 @@ async def sse_consumer(
             yield format_sse(entry.event, entry.data, event_id=entry.id or None)
 
     finally:
-        # store_only records are cross-worker runs hydrated from the RunStore; this
-        # worker holds no in-memory task/abort state for them, so run_mgr.cancel()
-        # cannot stop the task (it would 409). Skip on_disconnect cancellation for
-        # those and only act on runs this worker actually owns.
+        # store_only records are cross-worker observation handles. An explicit
+        # cancel-then-stream action has already persisted its request before
+        # subscribing; a plain join disconnect must not invent a new
+        # cancellation request. Only apply on_disconnect to locally-owned runs.
         if not gap_emitted and not record.store_only and record.status in (RunStatus.pending, RunStatus.running):
             if record.on_disconnect == DisconnectMode.cancel:
                 await run_mgr.cancel(record.run_id)

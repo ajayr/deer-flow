@@ -84,6 +84,26 @@ export interface Translations {
     linkCopied: string;
   };
 
+  artifactEditing: {
+    unsaved: string;
+    saving: string;
+    saved: string;
+    exit: string;
+    discard: string;
+    discardChanges: string;
+    conflict: string;
+    conflictShort: string;
+    runInProgress: string;
+    saveFailed: string;
+  };
+
+  artifactPreview: {
+    limited: (previewSize: string, totalSize?: string) => string;
+    loadFullFile: string;
+    loadingFullFile: string;
+    previewFailed: string;
+  };
+
   // Citations
   citations: {
     sourcesSummary: (count: number) => string;
@@ -582,6 +602,12 @@ export interface Translations {
     removeTodo: (content: string) => string;
   };
 
+  contextUsage: {
+    label: string;
+    title: string;
+    badgeAriaLabel: (percentage: string) => string;
+  };
+
   // Shortcuts
   shortcuts: {
     searchActions: string;
@@ -726,6 +752,7 @@ export interface Translations {
         auth: string;
         sandboxRuntime: string;
         sandboxRuntimeInitContainer: string;
+        sandboxRuntimeBroker: string;
         sandboxRuntimeGatewayDownload: string;
         sandboxRuntimeNotReady: string;
         notInstalled: string;

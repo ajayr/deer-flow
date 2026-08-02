@@ -18,12 +18,10 @@ Usage:
 import asyncio
 import concurrent.futures
 import copy
-import json
 import logging
 import mimetypes
 import os
 import shutil
-import tempfile
 import uuid
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -35,19 +33,26 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
-from deerflow.agents.lead_agent.agent import build_middlewares
+from deerflow.agents.lead_agent.agent import _authorize_model_name, build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template, get_enabled_skills_for_config
-from deerflow.agents.thread_state import freeze_delta_snapshot_frequency, get_thread_state_schema, normalize_middleware_state_schemas
+from deerflow.agents.thread_state import get_thread_state_schema, normalize_middleware_state_schemas
 from deerflow.authz.principal import build_principal_from_context
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, is_trace_correlation_enabled, reload_app_config
-from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
+from deerflow.config.extensions_config import (
+    ExtensionsConfig,
+    SkillStateConfig,
+    atomic_write_extensions_config,
+    get_extensions_config,
+    reload_extensions_config,
+)
 from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
 from deerflow.runtime import CheckpointStateAccessor
 from deerflow.runtime.checkpoint_mode import (
     ensure_checkpoint_mode_compatible,
     freeze_checkpoint_channel_mode,
+    freeze_checkpoint_snapshot_frequency,
     inject_checkpoint_mode,
 )
 from deerflow.runtime.goal import DEFAULT_MAX_GOAL_CONTINUATIONS, build_goal_state, goal_thread_lock, read_thread_goal, write_thread_goal
@@ -67,6 +72,7 @@ from deerflow.uploads.manager import (
     upload_artifact_url,
     upload_virtual_path,
 )
+from deerflow.utils.thread_id import resolve_thread_id, validate_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +198,7 @@ class DeerFlowClient:
             reload_app_config(config_path)
         self._app_config = get_app_config()
         self._checkpoint_channel_mode = freeze_checkpoint_channel_mode(self._app_config.database.checkpoint_channel_mode)
-        freeze_delta_snapshot_frequency(self._app_config.database.checkpoint_delta_snapshot_frequency)
+        self._checkpoint_snapshot_frequency = freeze_checkpoint_snapshot_frequency(self._app_config.database.checkpoint_delta.snapshot_frequency)
 
         if agent_name is not None and not AGENT_NAME_PATTERN.match(agent_name):
             raise ValueError(f"Invalid agent name '{agent_name}'. Must match pattern: {AGENT_NAME_PATTERN.pattern}")
@@ -228,20 +234,7 @@ class DeerFlowClient:
     @staticmethod
     def _atomic_write_json(path: Path, data: dict) -> None:
         """Write JSON to *path* atomically (temp file + replace)."""
-        fd = tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=path.parent,
-            suffix=".tmp",
-            delete=False,
-        )
-        try:
-            json.dump(data, fd, indent=2)
-            fd.close()
-            Path(fd.name).replace(path)
-        except BaseException:
-            fd.close()
-            Path(fd.name).unlink(missing_ok=True)
-            raise
+        atomic_write_extensions_config(path, data)
 
     def _get_runnable_config(self, thread_id: str, **overrides) -> RunnableConfig:
         """Build a RunnableConfig for agent invocation."""
@@ -288,6 +281,7 @@ class DeerFlowClient:
             self._agent_name,
             frozenset(self._available_skills) if self._available_skills is not None else None,
             self._checkpoint_channel_mode,
+            self._checkpoint_snapshot_frequency,
             authorization_identity,
         )
 
@@ -296,6 +290,16 @@ class DeerFlowClient:
 
         thinking_enabled = cfg.get("thinking_enabled", True)
         model_name = cfg.get("model_name")
+        # Phase 3: enforce model:use authorization on the embedded/library path
+        # too, mirroring the Gateway runtime path in ``_make_lead_agent`` so the
+        # role-scoped model policy cannot be bypassed by constructing the agent
+        # through ``DeerFlowClient``. Resolve the ``None`` default to a concrete
+        # name first (what ``create_chat_model(name=None)`` would pick) so the
+        # policy covers the implicit default model. ``cfg`` already carries the
+        # identity that ``apply_tool_authorization`` reads below.
+        if model_name is None and self._app_config.models:
+            model_name = self._app_config.models[0].name
+        model_name = _authorize_model_name(model_name, context=cfg, app_config=self._app_config)
         subagent_enabled = cfg.get("subagent_enabled", False)
         max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
         max_total_subagents = cfg.get("max_total_subagents", self._app_config.subagents.max_total_per_run)
@@ -359,6 +363,7 @@ class DeerFlowClient:
                     authorization_provider=_authz_provider,
                 ),
                 self._checkpoint_channel_mode,
+                self._checkpoint_snapshot_frequency,
             ),
             "system_prompt": apply_prompt_template(
                 subagent_enabled=subagent_enabled,
@@ -372,7 +377,7 @@ class DeerFlowClient:
                 user_id=effective_user_id,
                 skill_names=skill_setup.skill_names or None,
             ),
-            "state_schema": get_thread_state_schema(self._checkpoint_channel_mode),
+            "state_schema": get_thread_state_schema(self._checkpoint_channel_mode, self._checkpoint_snapshot_frequency),
         }
         checkpointer = self._checkpointer
         if checkpointer is None:
@@ -531,6 +536,7 @@ class DeerFlowClient:
 
     def get_goal(self, thread_id: str) -> dict:
         """Return the active goal for a thread, if any."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
         goal = _run_async_from_sync(read_thread_goal(checkpointer, thread_id))
         return {"goal": goal}
@@ -543,6 +549,7 @@ class DeerFlowClient:
         max_continuations: int = DEFAULT_MAX_GOAL_CONTINUATIONS,
     ) -> dict:
         """Set or replace a thread-scoped goal."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
         goal = build_goal_state(objective, max_continuations=max_continuations)
 
@@ -555,6 +562,7 @@ class DeerFlowClient:
 
     def clear_goal(self, thread_id: str) -> dict:
         """Clear the active goal for a thread."""
+        validate_thread_id(thread_id)
         checkpointer = self._get_thread_checkpointer()
 
         async def _clear_goal() -> None:
@@ -809,8 +817,7 @@ class DeerFlowClient:
               Tool results also include ``"artifact"`` when the source ToolMessage has a non-None artifact.
             - type="end"             data={"usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int}}
         """
-        if thread_id is None:
-            thread_id = str(uuid.uuid4())
+        thread_id = resolve_thread_id(thread_id)
 
         config = self._get_runnable_config(thread_id, **kwargs)
         inject_checkpoint_mode(config, self._checkpoint_channel_mode)
@@ -1287,13 +1294,19 @@ class DeerFlowClient:
             if config_path is None:
                 raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
-            extensions_config = get_extensions_config()
-            extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
+            from deerflow.skills.projection import skill_projection_mutation
 
-            config_data = extensions_config.to_file_dict()
+            removal_names = (name,) if not enabled else ()
+            with skill_projection_mutation(storage, "public", remove_names=removal_names):
+                # The projection lock is cross-process, but the singleton cache
+                # is not. Reload from disk under the lock before this RMW.
+                extensions_config = ExtensionsConfig.from_file(config_path)
+                extensions_config.skills[name] = SkillStateConfig(enabled=enabled)
 
-            self._atomic_write_json(config_path, config_data)
-            reload_extensions_config()
+                config_data = extensions_config.to_file_dict()
+
+                self._atomic_write_json(config_path, config_data)
+                reload_extensions_config()
         else:
             # CUSTOM / LEGACY: write per-user state
             from deerflow.skills.storage.user_scoped_skill_storage import UserScopedSkillStorage
@@ -1481,6 +1494,7 @@ class DeerFlowClient:
             FileNotFoundError: If any file does not exist.
             ValueError: If any supplied path exists but is not a regular file.
         """
+        validate_thread_id(thread_id)
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
         # Validate all files upfront to avoid partial uploads.
@@ -1584,6 +1598,7 @@ class DeerFlowClient:
             Dict with "files" and "count" keys, matching the Gateway API
             ``list_uploaded_files`` response.
         """
+        validate_thread_id(thread_id)
         uploads_dir = get_uploads_dir(thread_id)
         result = list_files_in_dir(uploads_dir)
         return enrich_file_listing(result, thread_id)
@@ -1603,6 +1618,7 @@ class DeerFlowClient:
             FileNotFoundError: If the file does not exist.
             PermissionError: If path traversal is detected.
         """
+        validate_thread_id(thread_id)
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS
 
         uploads_dir = get_uploads_dir(thread_id)
@@ -1626,6 +1642,7 @@ class DeerFlowClient:
             FileNotFoundError: If the artifact does not exist.
             ValueError: If the path is invalid.
         """
+        validate_thread_id(thread_id)
         try:
             actual = get_paths().resolve_virtual_path(thread_id, path, user_id=get_effective_user_id())
         except ValueError as exc:

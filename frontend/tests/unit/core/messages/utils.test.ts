@@ -244,6 +244,92 @@ test("reasoning + content (no tool calls) yields a single assistant bubble, not 
   expect(turnUsage.at(-1)?.map((message) => message.id)).toEqual(["ai-1"]);
 });
 
+test("keeps unresolved streaming text in the processing group when tool calls arrive later", () => {
+  const textOnlyMessages = [
+    { id: "human-1", type: "human", content: "Create a presentation" },
+    {
+      id: "ai-1",
+      type: "ai",
+      content: "I will inspect the source material first.",
+    },
+  ] as Message[];
+
+  const textOnlyGroups = getMessageGroups(textOnlyMessages, {
+    isCurrentTurnLoading: true,
+  });
+  expect(textOnlyGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+
+  const withToolCall = [
+    textOnlyMessages[0],
+    {
+      ...textOnlyMessages[1],
+      tool_calls: [
+        { id: "call-1", name: "read_file", args: { path: "slides.md" } },
+      ],
+    },
+  ] as Message[];
+  const toolCallGroups = getMessageGroups(withToolCall, {
+    isCurrentTurnLoading: true,
+  });
+  expect(toolCallGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+  expect(toolCallGroups[1]?.id).toBe(textOnlyGroups[1]?.id);
+
+  expect(getMessageGroups(textOnlyMessages).map((group) => group.type)).toEqual(
+    ["human", "assistant"],
+  );
+});
+
+test("keeps post-tool streaming text in the processing group until the turn settles", () => {
+  const messages = [
+    { id: "human-1", type: "human", content: "Inspect and summarize" },
+    {
+      id: "ai-1",
+      type: "ai",
+      content: "I will inspect the current implementation.",
+      tool_calls: [
+        { id: "call-1", name: "read_file", args: { path: "source.ts" } },
+      ],
+    },
+    {
+      id: "tool-1",
+      type: "tool",
+      name: "read_file",
+      tool_call_id: "call-1",
+      content: "file contents",
+    },
+    {
+      id: "ai-2",
+      type: "ai",
+      content: "Here is the final streamed answer.",
+    },
+  ] as Message[];
+
+  const loadingGroups = getMessageGroups(messages, {
+    isCurrentTurnLoading: true,
+  });
+  expect(loadingGroups.map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+  ]);
+  expect(loadingGroups[1]?.messages.map((message) => message.id)).toEqual([
+    "ai-1",
+    "tool-1",
+    "ai-2",
+  ]);
+
+  expect(getMessageGroups(messages).map((group) => group.type)).toEqual([
+    "human",
+    "assistant:processing",
+    "assistant",
+  ]);
+});
+
 test("keeps tool-call reasoning in the processing group while the final answer's reasoning rides its own bubble", () => {
   // Companion to #3868: only the message that also becomes an assistant bubble
   // (content, no tool calls) is pulled out of the processing group. Reasoning
@@ -513,6 +599,31 @@ describe("human message internal context stripping", () => {
         filename: "data.xlsx",
         size: 12 * 1024, // 12288
         path: "/mnt/user-data/uploads/data.xlsx",
+      },
+    ]);
+  });
+
+  test("parses uploaded filenames that contain parentheses", () => {
+    // Browsers name duplicate downloads "photo (1).png"; the backend emits the
+    // filename verbatim, so the parser must not stop the name at the first "(".
+    const content =
+      "<current_uploads>\nThe following files were uploaded in this message:\n\n- photo (1).png (12.3 KB)\n  Path: /mnt/user-data/uploads/photo (1).png\n- report (final) (2).docx (1.5 MB)\n  Path: /mnt/user-data/uploads/report (final) (2).docx\n- normal.pdf (3.0 KB)\n  Path: /mnt/user-data/uploads/normal.pdf\n</current_uploads>\n\nSummarize";
+
+    expect(parseUploadedFiles(content)).toEqual([
+      {
+        filename: "photo (1).png",
+        size: Math.round(12.3 * 1024),
+        path: "/mnt/user-data/uploads/photo (1).png",
+      },
+      {
+        filename: "report (final) (2).docx",
+        size: Math.round(1.5 * 1024 * 1024),
+        path: "/mnt/user-data/uploads/report (final) (2).docx",
+      },
+      {
+        filename: "normal.pdf",
+        size: 3 * 1024,
+        path: "/mnt/user-data/uploads/normal.pdf",
       },
     ]);
   });

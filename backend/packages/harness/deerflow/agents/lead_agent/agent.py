@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Mapping
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
@@ -46,7 +48,10 @@ from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
 from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
 from deerflow.agents.middlewares.tool_error_handling_middleware import build_lead_runtime_middlewares
 from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
-from deerflow.agents.thread_state import freeze_delta_snapshot_frequency, get_thread_state_schema, normalize_middleware_state_schemas
+from deerflow.agents.thread_state import get_thread_state_schema, normalize_middleware_state_schemas
+from deerflow.authz.principal import build_principal_from_context
+from deerflow.authz.provider import AuthzDecision, AuthzRequest
+from deerflow.authz.runtime import resolve_authorization_provider
 from deerflow.authz.tool_filter import apply_tool_authorization
 from deerflow.config.agents_config import load_agent_config, validate_agent_name
 from deerflow.config.app_config import AppConfig, get_app_config
@@ -56,6 +61,7 @@ from deerflow.models import create_chat_model
 from deerflow.runtime.checkpoint_mode import (
     INTERNAL_CHECKPOINT_MODE_KEY,
     freeze_checkpoint_channel_mode,
+    freeze_checkpoint_snapshot_frequency,
     frozen_checkpoint_channel_mode,
     inject_checkpoint_mode,
 )
@@ -132,6 +138,101 @@ def _resolve_model_name(requested_model_name: str | None = None, *, app_config: 
     if requested_model_name and requested_model_name != default_model_name:
         logger.warning(f"Model '{requested_model_name}' not found in config; fallback to default model '{default_model_name}'.")
     return default_model_name
+
+
+def _authorize_model_name(
+    model_name: str,
+    *,
+    context: Mapping[str, Any],
+    app_config: AppConfig,
+) -> str:
+    """Enforce ``model:use`` authorization on the resolved model name.
+
+    When ``authorization.enabled`` is false this is a no-op (returns
+    *model_name* unchanged). When enabled, the resolved model is checked
+    against the provider's policy via ``authorize("model", "use")`` so the
+    runtime path and the Gateway ``get_model`` route enforce the same
+    action-scoped contract (matters for custom providers that distinguish
+    ``list`` from ``use``). On deny, a graceful fallback to the first
+    ``filter_resources``-allowed model is attempted (RFC §9: "fall back to an
+    allowed default, not error, to avoid breaking runs"). If no model is
+    allowed and ``fail_closed`` is true, ``ValueError`` is raised (matching
+    the existing "no models configured" contract); fail-open returns the
+    original name.
+
+    Mirrors the Principal/provider pattern of ``apply_tool_authorization`` so
+    the tool path and the model path share one identity source.
+    """
+    authz_config = app_config.authorization
+    if authz_config.enabled is not True:
+        return model_name
+
+    provider = resolve_authorization_provider(authz_config)
+    if provider is None:
+        return model_name
+
+    principal = build_principal_from_context(context, default_role=authz_config.default_role)
+    all_names = [m.name for m in app_config.models]
+
+    # Check the resolved model against the action-scoped ``model:use`` policy.
+    # This aligns with the Gateway ``get_model`` route, which also checks
+    # ``authorize("model", "use")``. For the built-in RBAC provider (which
+    # ignores ``action``) this is equivalent to a membership check; for a
+    # custom provider that distinguishes ``list`` from ``use``, it prevents
+    # a model visible via ``filter_resources`` but denied for ``use`` from
+    # being silently selected at runtime.
+    try:
+        decision = provider.authorize(AuthzRequest(principal=principal, resource="model", action="use", target=model_name))
+        if not isinstance(decision, AuthzDecision):
+            raise TypeError("AuthorizationProvider.authorize must return AuthzDecision")
+        if decision.allow:
+            return model_name
+    except Exception:
+        logger.warning("Authorization provider failed while checking model:use for '%s'", model_name, exc_info=True)
+        if authz_config.fail_closed:
+            raise ValueError("No models are authorized for the current role (authorization provider error).")
+        return model_name
+
+    # Denied — graceful fallback: pick the first model that ``filter_resources``
+    # says is visible AND that also passes ``authorize("model", "use")``. For the
+    # built-in RBAC provider (which ignores ``action``) this is equivalent to
+    # picking the first visible name; for a custom provider that distinguishes
+    # ``list`` from ``use``, it ensures the fallback is actually usable.
+    try:
+        allowed_names = provider.filter_resources(principal, "model", all_names)
+        if not isinstance(allowed_names, list) or any(not isinstance(n, str) for n in allowed_names):
+            raise TypeError("AuthorizationProvider.filter_resources must return list[str]")
+    except Exception:
+        logger.warning("Authorization provider failed while resolving allowed models", exc_info=True)
+        if authz_config.fail_closed:
+            raise ValueError("No models are authorized for the current role (authorization provider error).")
+        return model_name
+
+    for candidate in allowed_names:
+        if candidate == model_name:
+            continue  # already denied above
+        try:
+            cb_decision = provider.authorize(AuthzRequest(principal=principal, resource="model", action="use", target=candidate))
+            if isinstance(cb_decision, AuthzDecision) and cb_decision.allow:
+                logger.warning(
+                    "Model '%s' is not authorized for the current role; fallback to '%s'.",
+                    model_name,
+                    candidate,
+                )
+                return candidate
+        except Exception:
+            logger.warning(
+                "Authorization provider failed while checking model:use fallback for '%s'",
+                candidate,
+                exc_info=True,
+            )
+            if authz_config.fail_closed:
+                raise ValueError("No models are authorized for the current role (authorization provider error).")
+            return model_name
+    if authz_config.fail_closed:
+        raise ValueError("No models are authorized for the current role.")
+    logger.warning("No models are authorized for the current role; fail_open allows '%s'.", model_name)
+    return model_name
 
 
 def _create_summarization_middleware(*, app_config: AppConfig | None = None, run_model_name: str | None = None) -> DeerFlowSummarizationMiddleware | None:
@@ -383,9 +484,13 @@ def build_middlewares(
     # Add TitleMiddleware
     middlewares.append(TitleMiddleware(app_config=resolved_app_config))
 
-    # Add MemoryMiddleware (after TitleMiddleware) — skipped in enabled tool mode
+    # Add MemoryMiddleware after TitleMiddleware. Tool mode normally skips it;
+    # conversation-extraction backends may explicitly retain passive writes.
     if should_use_memory_tools(resolved_app_config.memory):
-        pass
+        from deerflow.agents.memory.manager import backend_requires_passive_writes_in_tool_mode
+
+        if backend_requires_passive_writes_in_tool_mode(resolved_app_config.memory.manager_class):
+            middlewares.append(MemoryMiddleware(agent_name=agent_name, memory_config=resolved_app_config.memory))
     else:
         if resolved_app_config.memory.mode == "tool" and not resolved_app_config.memory.enabled:
             logger.warning("memory.mode is 'tool' but memory.enabled is false; memory tools will not be registered.")
@@ -518,7 +623,10 @@ def make_lead_agent(config: RunnableConfig):
             runtime_app_config.database.checkpoint_channel_mode,
         )
     mode = freeze_checkpoint_channel_mode(requested_mode)
-    freeze_delta_snapshot_frequency(runtime_app_config.database.checkpoint_delta_snapshot_frequency)
+    # The snapshot cadence travels with the mode: restart-required, frozen
+    # from the app config, and deliberately not client-injectable (a forged
+    # configurable key must not recompile the channel table either).
+    freeze_checkpoint_snapshot_frequency(runtime_app_config.database.checkpoint_delta.snapshot_frequency)
     inject_checkpoint_mode(config, mode)
     return _make_lead_agent(config, app_config=runtime_app_config)
 
@@ -536,13 +644,12 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
         resolved_app_config.database.checkpoint_channel_mode,
     )
 
-    # Extract user_id for user-scoped skill loading.
-    # LangGraph gateway injects user_id into config["configurable"];
-    # fall back to the runtime contextvar when not present.
-    from deerflow.runtime.user_context import get_effective_user_id
+    # Resolve one authoritative identity for every user-scoped factory input.
+    # Agent Server's reserved auth fields win over ordinary client-supplied
+    # context/configurable values; the embedded Gateway path uses context.user_id.
+    from deerflow.runtime.user_context import resolve_config_user_id
 
-    runtime_user_id = cfg.get("user_id")
-    resolved_user_id = str(runtime_user_id) if runtime_user_id else get_effective_user_id()
+    resolved_user_id = resolve_config_user_id(config)
 
     requested_model_name: str | None = cfg.get("model_name") or cfg.get("model")
     is_plan_mode = cfg.get("is_plan_mode", False)
@@ -553,7 +660,7 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     non_interactive = bool(cfg.get("non_interactive", False))
     agent_name = validate_agent_name(cfg.get("agent_name"))
 
-    agent_config = load_agent_config(agent_name) if not is_bootstrap else None
+    agent_config = load_agent_config(agent_name, user_id=resolved_user_id) if not is_bootstrap else None
     available_skills = _available_skill_names(agent_config, is_bootstrap)
     # Custom agent model from agent config (if any), or None to let _resolve_model_name pick the default
     agent_model_name = agent_config.model if agent_config and agent_config.model else None
@@ -573,6 +680,10 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
 
     # Final model name resolution: request → agent config → global default, with fallback for unknown names
     model_name = _resolve_model_name(requested_model_name or agent_model_name, app_config=resolved_app_config)
+
+    # Phase 3: enforce model:use authorization. On deny, fall back to the first
+    # allowed model (graceful) rather than crashing the run (RFC §9).
+    model_name = _authorize_model_name(model_name, context=cfg, app_config=resolved_app_config)
 
     model_config = resolved_app_config.get_model_config(model_name)
 

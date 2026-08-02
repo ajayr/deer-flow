@@ -91,6 +91,8 @@ Async task delegation with concurrent execution:
 LLM-powered persistent context retention across conversations:
 
 - **Automatic extraction**: Analyzes conversations for user context, facts, and preferences
+- **Scope-safe writes**: Middleware extraction stores only durable, descriptive user-level facts; global summaries also require descriptive authority, while contradiction removals and consolidated facts fail closed when scope metadata is missing or task/project-local
+- **Atomic replacements**: A contradiction removal linked to a replacement runs only after the replacement survives scope/confidence gates, deduplication, and fact-limit trimming
 - **Structured storage**: User context (work, personal, top-of-mind), history, and confidence-scored facts
 - **Debounced updates**: Batches updates to minimize LLM calls (configurable wait time)
 - **System prompt injection**: Top facts + context injected into agent prompts
@@ -454,8 +456,18 @@ the only execution path, which keeps operational mistakes off the table. See
 ### Testing
 
 ```bash
-uv run pytest
+# Offline backend suite (live external-API tests are excluded)
+make test
+
+# Explicit real-API DeerFlowClient integration suite
+make test-live
 ```
+
+The live suite requires a valid root `config.yaml` and API credentials. It may
+incur API costs or create local sandboxes, artifacts, and files, so it is not
+part of default test runs or CI. Direct pytest invocation of
+`tests/test_client_live.py` also requires
+`DEER_FLOW_RUN_LIVE_TESTS=1`.
 
 `make detect-blocking-io` statically scans backend business code for blocking
 IO that may run on the backend event loop and is not test-coverage-bound. It

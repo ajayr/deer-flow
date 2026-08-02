@@ -100,6 +100,29 @@ export const zhCN: Translations = {
     linkCopied: "链接已复制到剪贴板",
   },
 
+  artifactEditing: {
+    unsaved: "未保存",
+    saving: "正在保存...",
+    saved: "文件已保存",
+    exit: "退出编辑",
+    discard: "放弃修改",
+    discardChanges: "要放弃对此文件的未保存修改吗？",
+    conflict: "开始编辑后文件已发生变化。请放弃草稿并重新加载后再保存。",
+    conflictShort: "远端已更新",
+    runInProgress: "请等待当前 Agent 运行结束后再保存。",
+    saveFailed: "保存文件失败",
+  },
+
+  artifactPreview: {
+    limited: (previewSize, totalSize) =>
+      totalSize
+        ? `当前显示 ${totalSize} 中的前 ${previewSize}。`
+        : `当前显示前 ${previewSize}。`,
+    loadFullFile: "加载完整文件",
+    loadingFullFile: "正在加载完整文件...",
+    previewFailed: "无法预览此文件，但仍可下载原始文件。",
+  },
+
   // Citations
   citations: {
     sourcesSummary: (count) => `使用了 ${count} 个来源`,
@@ -672,6 +695,12 @@ export const zhCN: Translations = {
     removeTodo: (content: string) => `移除 To-do：${content}`,
   },
 
+  contextUsage: {
+    label: "上下文",
+    title: "上下文窗口",
+    badgeAriaLabel: (percentage: string) => `上下文窗口已使用 ${percentage}%`,
+  },
+
   // Shortcuts
   shortcuts: {
     searchActions: "搜索操作...",
@@ -822,6 +851,7 @@ export const zhCN: Translations = {
         auth: "授权",
         sandboxRuntime: "沙箱运行时",
         sandboxRuntimeInitContainer: "由 init container 提供",
+        sandboxRuntimeBroker: "由 broker sidecar 提供",
         sandboxRuntimeGatewayDownload: "由 Gateway 提供",
         sandboxRuntimeNotReady: "未就绪 —— 对话时 lark-cli 可能不可用",
         notInstalled: "尚未安装",

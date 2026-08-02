@@ -143,6 +143,10 @@ class MemoryManager(BaseModel):
     # that fails fast at instantiation rather than silently returning empty
     # results). Default False: a new backend must explicitly opt in to tool mode.
     supports_search: ClassVar[bool] = False
+    # Backends that rely on conversation-level extraction instead of fact CRUD
+    # can retain MemoryMiddleware writes while tool mode supplies query-aware
+    # search. Most backends keep tool mode fully model-directed.
+    requires_passive_writes_in_tool_mode: ClassVar[bool] = False
 
     @model_validator(mode="after")
     def _check_invariants(self) -> MemoryManager:
@@ -585,6 +589,15 @@ def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
     )
 
 
+def backend_requires_passive_writes_in_tool_mode(manager_class: str) -> bool:
+    """Return whether a backend needs middleware writes in tool mode.
+
+    Resolve the class without constructing it so agent assembly does not run
+    backend startup checks or perform network I/O.
+    """
+    return _resolve_manager_class(manager_class).requires_passive_writes_in_tool_mode
+
+
 # ── Host-default hook providers (passed to from_config by the factory) ────
 #
 # These callables are the host's defaults for the slots a backend may consume
@@ -681,6 +694,8 @@ def _host_default_extraction_callback(payload: Any) -> None:
     extracted = payload.get("facts_extracted")
     passed_confidence = payload.get("facts_passed_confidence")
     rejected = payload.get("rejected_low_confidence", 0)
+    rejected_by_scope = payload.get("rejected_by_scope_gate", 0)
+    scope_breakdown = payload.get("scope_gate_rejections")
     thread_id = payload.get("thread_id")
     model_name = payload.get("model_name")
     if isinstance(extracted, int) and isinstance(passed_confidence, int) and extracted > 0:
@@ -708,6 +723,22 @@ def _host_default_extraction_callback(payload: Any) -> None:
             payload.get("success"),
             payload.get("token_usage"),
         )
+    if isinstance(scope_breakdown, dict):
+        logger.info(
+            "Memory scope-gate metrics: thread=%s model=%s rejected=%s breakdown=%s",
+            thread_id,
+            model_name,
+            rejected_by_scope,
+            scope_breakdown,
+        )
+        fact_breakdown = scope_breakdown.get("facts")
+        fact_scope_rejected = sum(value for value in fact_breakdown.values() if isinstance(value, int)) if isinstance(fact_breakdown, dict) else 0
+        if isinstance(extracted, int) and extracted > 0 and fact_scope_rejected / extracted > 0.6:
+            logger.warning(
+                "Memory fact scope-gate rejection rate %.0f%% exceeds 60%% - review extraction model classification / prompt (thread=%s)",
+                fact_scope_rejected / extracted * 100,
+                thread_id,
+            )
 
 
 def _collect_host_hooks() -> dict[str, Any]:
