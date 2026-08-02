@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,7 +12,7 @@ pytest.importorskip("coincurve")
 
 from app.channels import buzz_nostr
 from app.channels.base import Channel
-from app.channels.buzz import EDIT_MAX_BYTES, MAX_CACHED_CHANNELS, MAX_CHANNEL_SUBSCRIPTIONS, BuzzChannel, _chunk_text
+from app.channels.buzz import EDIT_MAX_BYTES, MAX_CACHED_CHANNELS, MAX_CHANNEL_SUBSCRIPTIONS, MAX_RESUBSCRIBE_ATTEMPTS, MEMBERSHIP_LOOKBACK_SECONDS, BuzzChannel, _chunk_text
 from app.channels.manager import CHANNEL_CAPABILITIES
 from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage
 from app.channels.run_policy import CHANNEL_RUN_POLICY
@@ -1383,6 +1384,7 @@ def test_session_reestablishes_auth_discovery_and_per_channel_subscriptions_on_r
             except asyncio.CancelledError:
                 pass
 
+    started_at = int(time.time())
     asyncio.run(asyncio.wait_for(run(), timeout=10))
 
     assert len(sockets) == 2, "expected the relay loop to reconnect"
@@ -1390,8 +1392,13 @@ def test_session_reestablishes_auth_discovery_and_per_channel_subscriptions_on_r
         by_sub = _reqs_by_sub(ws)
         assert [f for f in ws.sent if f[0] == "AUTH"], "expected NIP-42 auth on every connection"
         assert by_sub["buzz-discovery"] == [{"kinds": [39000]}]
-        assert by_sub["buzz-membership"] == [{"kinds": [44100, 44101], "#p": [PK3_HEX]}]
         assert by_sub[f"buzz-chat-{CHANNEL}"] == [{"kinds": [9], "#h": [CHANNEL]}]
+        # Membership is LIVE-only: the kinds/#p shape is unchanged, plus a `since`
+        # anchored at this connection so the relay's stored membership history is
+        # never replayed as if it had just happened (resilience FINDING 3).
+        (membership_filter,) = by_sub["buzz-membership"]
+        assert membership_filter["kinds"] == [44100, 44101] and membership_filter["#p"] == [PK3_HEX]
+        assert membership_filter["since"] >= started_at - MEMBERSHIP_LOOKBACK_SECONDS
 
 
 def test_session_end_drops_chat_subscription_bookkeeping():
@@ -1402,3 +1409,290 @@ def test_session_end_drops_chat_subscription_bookkeeping():
     asyncio.run(ch._session(ws))
     assert ch._chat_subscriptions == set()
     assert ch._transport is None
+
+
+# -- RESILIENCE REVIEW: a CLOSED subscription must not deafen the connector --------
+#
+# FINDING 1: a post-auth `CLOSED` for a control subscription (`buzz-discovery` /
+#   `buzz-membership`) was logged at INFO and never re-issued, so the connector
+#   silently stopped learning about channels it is added to or removed from for the
+#   life of that socket.
+# FINDING 2: a `CLOSED` for a chat subscription was forgotten with no retry, so a
+#   transient relay CLOSE deafened exactly one channel for the rest of the
+#   connection -- invisibly. Nothing re-opened it until a 44100 for that channel or
+#   a full reconnect.
+# FINDING 3: the membership filter carried no `since`, so every connection replayed
+#   the entire stored membership history: each historical 44100 logged "added to
+#   channel ...; subscribing" as if it were live and re-ran discovery, producing
+#   M+1 discovery passes per connect (the live log's TWO "channel discovery
+#   complete" lines), re-subscribing channels we have since been removed from, and
+#   letting a historical 44101 transiently drop a channel we ARE still in.
+
+
+def _reqs_for(transport, sub_id):
+    return [f for f in transport.sent if f[0] == "REQ" and f[1] == sub_id]
+
+
+def test_post_auth_close_of_a_control_subscription_is_reopened(monkeypatch, caplog):
+    """FINDING 1: the control subscriptions are opened ONLY by
+    `_open_control_subscriptions`, which runs at session start and in the auth
+    branch. A relay hiccup that CLOSEs `buzz-membership` after auth therefore ended
+    membership tracking for the life of the socket -- the connector stops learning
+    about channels it is added to or removed from, and nothing says so. Same for
+    `buzz-discovery`, whose death also kills the EOSE sweep and the "no channels"
+    warning."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-membership", "error: subscription dropped"])))
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-discovery", ""])))
+
+    by_sub = _reqs_by_sub(transport)
+    assert by_sub["buzz-discovery"] == [{"kinds": [39000]}]
+    (membership_filter,) = by_sub["buzz-membership"]
+    assert membership_filter["kinds"] == [buzz_nostr.KIND_MEMBER_ADDED, buzz_nostr.KIND_MEMBER_REMOVED]
+    assert membership_filter["#p"] == [PK3_HEX]
+    # A dead control subscription is an outage, not an INFO-level curiosity.
+    assert "buzz-membership" in caplog.text and "buzz-discovery" in caplog.text
+
+
+def test_control_resubscription_is_bounded_so_a_closing_relay_is_never_fought_forever(monkeypatch, caplog):
+    """Re-issuing immediately is a tight loop if the relay keeps closing it, so the
+    retries are bounded per connection and the exhaustion is loud."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        for _ in range(MAX_RESUBSCRIBE_ATTEMPTS + 4):
+            asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-membership", "error: try again"])))
+
+    assert len(_reqs_for(transport, "buzz-membership")) == MAX_RESUBSCRIBE_ATTEMPTS
+    assert "gave up" in caplog.text
+
+
+def test_re_auth_restores_the_control_resubscribe_budget():
+    """The budget is per connection AND per auth epoch: pre-auth CLOSEDs (which the
+    auth branch already recovers from wholesale) must not spend the budget that
+    protects the authenticated session."""
+    ch, _ = _started()
+    ch._resubscribe_attempts["buzz-membership"] = MAX_RESUBSCRIBE_ATTEMPTS
+    ws = ScriptedWS(['["AUTH","challenge-1"]'])
+    asyncio.run(ch._session(ws))
+    assert ch._resubscribe_attempts == {}
+
+
+def test_transient_close_of_a_chat_subscription_reopens_that_channel(monkeypatch, caplog):
+    """FINDING 2: the precise failure class this whole fix exists to eliminate -- one
+    channel goes deaf for the rest of the connection and nothing says so."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    assert ch._chat_subscriptions == {CHANNEL}
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL}", "error: relay hiccup"])))
+
+    assert ch._chat_subscriptions == {CHANNEL}  # re-opened, not silently dropped
+    assert len(_reqs_for(transport, f"buzz-chat-{CHANNEL}")) == 2
+    assert CHANNEL in caplog.text  # the channel going unlistened is named at WARNING
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "channel access revoked",
+        "restricted: you are not a member of this channel",
+        "auth-required: we can only serve channel members",
+        "blocked: pubkey is not allowed here",
+        "invalid: unknown channel",
+        # A permanent condition wearing a generic, retryable-looking category: the
+        # NIP-01 prefix is only the category, the actual reason is the remainder.
+        "error: channel not found",
+    ],
+)
+def test_a_legitimate_close_of_a_chat_subscription_is_never_retried(monkeypatch, reason):
+    """Do not fight the relay: a close that says we were removed, are unauthorized,
+    or sent an unacceptable filter cannot be fixed by re-issuing the same REQ."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL}", reason])))
+
+    assert ch._chat_subscriptions == set()
+    assert len(_reqs_for(transport, f"buzz-chat-{CHANNEL}")) == 1  # never re-issued
+
+
+def test_chat_resubscription_is_bounded_per_connection(monkeypatch, caplog):
+    ch, _ = _started()
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        for _ in range(MAX_RESUBSCRIBE_ATTEMPTS + 4):
+            asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL}", "error: flapping"])))
+
+    # 1 original REQ + exactly MAX_RESUBSCRIBE_ATTEMPTS retries, then it stops.
+    assert len(_reqs_for(transport, f"buzz-chat-{CHANNEL}")) == 1 + MAX_RESUBSCRIBE_ATTEMPTS
+    assert ch._chat_subscriptions == set()
+    assert "gave up" in caplog.text
+
+
+def test_a_close_for_a_channel_we_never_subscribed_to_never_induces_a_subscription(monkeypatch):
+    """A CLOSED frame is relay-supplied. Recovering one we never opened would let any
+    relay induce a chat subscription to a channel of its choosing just by naming it."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL_B}", "error: hiccup"])))
+
+    assert transport.sent == []
+    assert ch._chat_subscriptions == set()
+
+
+def test_membership_filter_is_scoped_to_live_events_so_history_is_never_replayed():
+    """FINDING 3: buzz-relay STORES 44100/44101 events and serves history
+    newest-first (default limit 2000). Without a `since`, every connection replayed
+    the whole membership history: each stored 44100 logged "added to channel ...;
+    subscribing" as if it were live, re-subscribed channels we have since been
+    removed from, and a stored 44101 transiently dropped a channel we ARE still in."""
+    ch, _ = _started()
+    before = int(time.time())
+    ws = ScriptedWS([])
+    asyncio.run(ch._session(ws))
+    after = int(time.time())
+
+    (frame,) = _reqs_for(ws, "buzz-membership")
+    (membership_filter,) = [f for f in frame[2:] if isinstance(f, dict)]
+    assert membership_filter["kinds"] == [buzz_nostr.KIND_MEMBER_ADDED, buzz_nostr.KIND_MEMBER_REMOVED]
+    assert membership_filter["#p"] == [PK3_HEX]
+    since = membership_filter["since"]
+    # Anchored at connection time (minus a bounded slack for relay clock skew and
+    # the handshake window), never at the epoch.
+    assert before - MEMBERSHIP_LOOKBACK_SECONDS <= since <= after
+    # ... so nothing stored before this connection -- every fixture event included --
+    # can come back as if it were live.
+    assert since > 1700000070
+
+
+CHANNEL_STALE = "9f1c4d3a-77b2-4e10-9a55-2c6d8e0b1f34"  # we were added to it once, and removed since
+
+
+class StoringRelayWS:
+    """A fake relay that STORES events and honours `since`, the way buzz-relay does.
+
+    This is what makes the historical-replay symptom reproducible without a live
+    relay: whether the connector's stored membership history comes back is decided
+    by the connector's OWN filter, so an unscoped `buzz-membership` REQ replays it
+    and a `since`-scoped one does not. It is also closed pre-auth (REQs are answered
+    with `auth-required:` until the NIP-42 handshake completes), which is why the
+    connector re-runs discovery after authenticating.
+    """
+
+    def __init__(self, stored, *, challenge="challenge-1"):
+        self.stored = list(stored)
+        self.sent = []
+        self.authenticated = False
+        self._pending = [json.dumps(["AUTH", challenge])]
+
+    @staticmethod
+    def _matches(ev, filt):
+        if ev["kind"] not in filt.get("kinds", []):
+            return False
+        if "since" in filt and ev["created_at"] < filt["since"]:
+            return False
+        return all(set(buzz_nostr.tag_values(ev, key[1:])) & set(wanted) for key, wanted in filt.items() if key.startswith("#"))
+
+    async def send(self, text):
+        frame = json.loads(text)
+        self.sent.append(frame)
+        if frame[0] == "AUTH":
+            self.authenticated = True
+            return
+        if frame[0] != "REQ":
+            return
+        sub_id, filters = frame[1], [f for f in frame[2:] if isinstance(f, dict)]
+        if not self.authenticated:
+            self._pending.append(json.dumps(["CLOSED", sub_id, "auth-required: we only serve authenticated members"]))
+            return
+        self._pending.extend(json.dumps(["EVENT", sub_id, ev]) for ev in self.stored if any(self._matches(ev, f) for f in filters))
+        self._pending.append(json.dumps(["EOSE", sub_id]))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._pending:
+            raise StopAsyncIteration
+        return self._pending.pop(0)
+
+
+def test_one_connect_performs_exactly_one_discovery_pass_and_replays_no_membership_history(caplog):
+    """Directly pins the duplicate-discovery symptom seen live.
+
+    buzz-relay stores 44100/44101 events, so an unscoped `buzz-membership` filter
+    replayed the whole membership history on every connect. Each stored 44100 read
+    as live: it logged "added to channel ...; subscribing", re-subscribed even to
+    channels we have since been removed from, and re-issued the discovery REQ -- so
+    one connect produced M+1 discovery passes over N stored kind-39000 events (the
+    two "channel discovery complete" lines in the live log; the `<unnamed>` channel
+    came from the 44100 path subscribing before that channel's metadata arrived).
+
+    The relay double here honours `since` exactly as the real one does, so the
+    connector's own filter is what decides the outcome."""
+    ch, _ = _started()
+    ws = StoringRelayWS(
+        [
+            _meta_event(CHANNEL, name="general"),
+            _meta_event(CHANNEL_B, name="ops"),
+            # Stored membership history: one add for a channel we are still in, one
+            # for a channel we have since been removed from. Both long past.
+            _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL, created_at=1600000000),
+            _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL_STALE, created_at=1600000001),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.channels.buzz"):
+        asyncio.run(ch._session(ws))
+
+    assert caplog.text.count("channel discovery complete") == 1
+    # The pre-auth REQ (which this relay answers with `auth-required:`) and its
+    # post-auth re-issue -- and no third one from a replayed 44100.
+    assert len(_reqs_for(ws, "buzz-discovery")) == 2
+    # (`_chat_subscriptions` is per-socket and cleared by `_session`'s finally, so the
+    # wire is what proves each discovered channel was subscribed exactly once.)
+    for channel_id in (CHANNEL, CHANNEL_B):
+        assert _reqs_for(ws, f"buzz-chat-{channel_id}") == [["REQ", f"buzz-chat-{channel_id}", {"kinds": [9], "#h": [channel_id]}]]
+    # A channel we were removed from is never resurrected by its stored add.
+    assert _reqs_for(ws, f"buzz-chat-{CHANNEL_STALE}") == []
+    assert "added to channel" not in caplog.text
+    assert "<unnamed>" not in caplog.text
+
+
+def test_membership_add_for_an_already_known_channel_does_not_re_run_discovery():
+    """Belt and braces for the same symptom: discovery is re-issued only when the new
+    channel's name/type are actually missing, so a duplicate (or replayed) 44100
+    cannot multiply discovery passes."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    baseline = len(_reqs_for(transport, "buzz-discovery"))
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL)])))
+
+    assert len(_reqs_for(transport, "buzz-discovery")) == baseline
+    assert ch._chat_subscriptions == {CHANNEL}
