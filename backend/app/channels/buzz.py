@@ -122,15 +122,31 @@ MEMBERSHIP_LOOKBACK_SECONDS = 60
 # Bound on how long ``stop()`` waits for the cancelled relay loop to finish.
 STOP_TIMEOUT_SECONDS = 5.0
 
-# NIP-01 asks relays to give ``CLOSED`` a machine-readable prefix (NIP-42 adds
-# ``auth-required:``). These are the ones where re-issuing the IDENTICAL REQ cannot
-# succeed, so retrying is just fighting the relay:
-#   auth-required: -- the relay wants a fresh NIP-42 AUTH, and it sends an ``AUTH``
+# NIP-42's machine-readable ``CLOSED`` prefix for "authenticate first".
+#
+# BEFORE this connection has completed its NIP-42 handshake this is not a refusal
+# at all -- it is the expected bootstrap sequence. ``_session`` deliberately opens
+# the control subscriptions immediately, in case the relay serves unauthenticated
+# reads; a closed relay answers ``auth-required:`` and an ``AUTH`` challenge, and
+# the auth branch then re-opens every subscription. Treating that as a permanent
+# refusal produced an operator-facing warning claiming discovery/membership
+# tracking was DOWN at the exact moment it was coming up -- observed live, in the
+# same run where discovery then completed, every channel was subscribed, and a
+# brand-new channel's kind-44100 was picked up one second later.
+#
+# AFTER the handshake the same reason means the relay stopped accepting our
+# authenticated session, which is a genuine outage and stays loud.
+_AUTH_REQUIRED_CLOSE_PREFIX = "auth-required:"
+
+# NIP-01 asks relays to give ``CLOSED`` a machine-readable prefix. These are the
+# ones where re-issuing the IDENTICAL REQ cannot succeed, so retrying is just
+# fighting the relay:
+#   auth-required: -- the relay wants a NIP-42 AUTH, and it sends an ``AUTH``
 #                     challenge to say so; ``_session``'s auth branch re-opens every
 #                     subscription once that completes, which is the real recovery.
 #   restricted: / blocked: / mute: -- this identity is not permitted to read this.
 #   invalid: / pow: -- the filter itself was rejected; the same filter will be again.
-_PERMANENT_CLOSE_PREFIXES = ("auth-required:", "restricted:", "blocked:", "mute:", "invalid:", "pow:")
+_PERMANENT_CLOSE_PREFIXES = (_AUTH_REQUIRED_CLOSE_PREFIX, "restricted:", "blocked:", "mute:", "invalid:", "pow:")
 
 # buzz-relay does not always use a NIP-01 prefix -- it closes a channel's
 # subscription with prose when access is revoked (e.g. the channel was archived, or
@@ -176,6 +192,27 @@ def _chunk_text(text: str, limit: int = EDIT_MAX_BYTES) -> list[str]:
     if current:
         chunks.append("".join(current))
     return chunks or [""]
+
+
+def _is_auth_required_close(reason: str) -> bool:
+    """Does the relay's ``CLOSED`` reason say "authenticate first" (NIP-42)?"""
+    return (reason or "").strip().lower().startswith(_AUTH_REQUIRED_CLOSE_PREFIX)
+
+
+# DeerFlow's hidden model-context wrappers. These are literal tags this codebase
+# injects into the model's input and never into an assistant reply:
+# ``DynamicContextMiddleware`` wraps recalled memory in ``<memory>`` and the date
+# reminder in ``<system-reminder>``; ``DurableContextMiddleware`` wraps the
+# conversation summary, delegation ledger and active skills in
+# ``<durable_context_data>``. Matching the opening tag (not the words) is what
+# keeps an ordinary reply that merely talks about memory publishable.
+_HIDDEN_CONTEXT_MARKERS = ("<memory>", "<durable_context_data>", "<system-reminder>")
+
+
+def _hidden_context_marker(text: str) -> str | None:
+    """Return the hidden-context wrapper *text* carries, if any."""
+    lowered = (text or "").lower()
+    return next((marker for marker in _HIDDEN_CONTEXT_MARKERS if marker in lowered), None)
 
 
 def _is_transient_close(reason: str) -> bool:
@@ -230,6 +267,7 @@ class BuzzChannel(Channel):
         self._seen_created_at: dict[str, int] = {}  # channel id -> high-water mark of PROCESSED created_at (see _advance_watermark)
         self._chat_subscriptions: set[str] = set()  # channel ids with a live per-channel REQ on the CURRENT connection
         self._resubscribe_attempts: dict[str, int] = {}  # sub id -> CLOSED-recovery attempts spent on the current connection/auth epoch
+        self._auth_completed = False  # has THIS socket completed its NIP-42 handshake? (see _AUTH_REQUIRED_CLOSE_PREFIX)
         self._session_started_at: int | None = None  # wall clock at which the CURRENT socket opened; anchors the live membership filter
         self._transport: Any = None
         self._task: asyncio.Task | None = None
@@ -318,6 +356,7 @@ class BuzzChannel(Channel):
         self._channel_meta.clear()
         self._chat_subscriptions.clear()
         self._resubscribe_attempts.clear()
+        self._auth_completed = False
         self._session_started_at = None
         self._pending_auth_challenge = None
         logger.info("[buzz] channel stopped")
@@ -493,7 +532,23 @@ class BuzzChannel(Channel):
         "no channels" warning. Forgetting the subscription is therefore only half a
         response -- something has to re-open it, or the connector runs the rest of
         that socket's life quietly missing traffic it believes it is receiving.
+
+        The one close that is NOT an outage is ``auth-required:`` before this
+        socket has completed its NIP-42 handshake: that is the bootstrap sequence
+        working as designed (opportunistic pre-auth REQs, refused by a closed
+        relay, re-opened wholesale by ``_session``'s auth branch). It is handled
+        here, ahead of every recovery path, so it consumes neither the
+        permanent-refusal branch nor the retry budget and says nothing alarming --
+        the previous behaviour warned that discovery/membership tracking was down
+        at the exact moment it was coming up. A chat subscription is still dropped
+        from the live set, because it genuinely is not subscribed from this moment
+        and the auth branch/discovery sweep is what re-opens it.
         """
+        if _is_auth_required_close(reason) and not self._auth_completed:
+            if sub_id.startswith(CHAT_SUB_PREFIX):
+                self._chat_subscriptions.discard(sub_id[len(CHAT_SUB_PREFIX) :])
+            logger.debug("[buzz] relay closed %s pending NIP-42 auth (%s); the auth handshake re-opens it", sub_id, reason or "<no reason>")
+            return
         if sub_id == DISCOVERY_SUB_ID or sub_id == MEMBERSHIP_SUB_ID:
             await self._recover_control_subscription(sub_id, reason)
         elif sub_id.startswith(CHAT_SUB_PREFIX):
@@ -512,11 +567,23 @@ class BuzzChannel(Channel):
         A permanent reason is not retried here, and for ``auth-required:`` that is
         not a gap: the relay pairs it with an ``AUTH`` challenge, and ``_session``'s
         auth branch re-opens both control subscriptions once the NIP-42 handshake
-        completes. Re-issuing here as well would only race that.
+        completes. Re-issuing here as well would only race that. (The *pre*-auth
+        ``auth-required:`` case never reaches this function at all -- see
+        ``_handle_closed`` -- because there nothing is down.)
+
+        The two permanent branches are logged separately because they are not the
+        same outage. A relay demanding re-authentication mid-session is recovered
+        by the next ``AUTH`` challenge; a ``restricted:``/``blocked:``/``invalid:``
+        refusal is not recovered until the connection is rebuilt. Saying "down
+        until the next reconnect or NIP-42 re-auth" for both was what made the
+        bootstrap warning read as an outage report.
         """
         logger.warning("[buzz] relay closed control subscription %s: %s", sub_id, reason or "<no reason>")
         if not _is_transient_close(reason):
-            logger.warning("[buzz] not re-opening %s: the relay refused it. Channel discovery/membership tracking is down until the next reconnect or NIP-42 re-auth.", sub_id)
+            if _is_auth_required_close(reason):
+                logger.warning("[buzz] relay demanded re-authentication for %s AFTER this connection completed NIP-42 auth. It stays down until the relay's next AUTH challenge re-opens it, or until the next reconnect.", sub_id)
+            else:
+                logger.warning("[buzz] not re-opening %s: the relay refused it. Channel discovery/membership tracking is down until the next reconnect.", sub_id)
             return
         attempt = self._claim_resubscribe_attempt(sub_id)
         if attempt is None:
@@ -623,11 +690,21 @@ class BuzzChannel(Channel):
         REQ that the relay closed because we had not authenticated yet is recovered
         wholesale by the auth branch, and must not spend the budget that protects the
         authenticated session from a relay that keeps closing a live subscription.
+
+        ``_auth_completed`` is the same boundary expressed as a flag, and it is
+        strictly per socket (cleared on entry AND in ``finally``): it is what lets
+        ``_handle_closed`` tell the expected bootstrap ``auth-required:`` refusal
+        apart from a relay that stops honouring an already-authenticated session.
+        It is set as soon as the signed AUTH event has been sent, which is the
+        connector's whole side of the NIP-42 handshake -- a relay that then rejects
+        that AUTH and keeps answering ``auth-required:`` is a real problem, and
+        being loud about it is the point.
         """
         self._transport = ws
         self._session_started_at = int(time.time())
         self._chat_subscriptions.clear()
         self._resubscribe_attempts.clear()
+        self._auth_completed = False
         try:
             await self._open_control_subscriptions(ws)
             async for raw in ws:
@@ -638,6 +715,7 @@ class BuzzChannel(Channel):
                     self._pending_auth_challenge = None
                     auth = buzz_nostr.build_auth_event(self._keys, self._relay_url, challenge, created_at=int(time.time()))
                     await ws.send(json.dumps(["AUTH", auth], separators=(",", ":")))
+                    self._auth_completed = True
                     self._chat_subscriptions.clear()
                     self._resubscribe_attempts.clear()
                     await self._open_control_subscriptions(ws)
@@ -645,6 +723,7 @@ class BuzzChannel(Channel):
             self._transport = None
             self._chat_subscriptions.clear()
             self._resubscribe_attempts.clear()
+            self._auth_completed = False
             self._session_started_at = None
 
     async def _run_loop(self) -> None:
@@ -1166,10 +1245,28 @@ class BuzzChannel(Channel):
         ``finally`` block precisely so that a raised exception still propagates
         to the caller *and* still clears the stale target — see the ``finally``
         comment for why both matter.
+
+        DEFENSE IN DEPTH: text carrying one of DeerFlow's hidden model-context
+        wrappers is refused outright. The real fix is one layer up
+        (``manager._accumulate_stream_text`` now allowlists assistant message
+        types instead of denylisting tool ones), but this connector is the one
+        where a leak cannot be taken back: every streaming update is an immutable
+        public Nostr event, so a corrective edit only changes what clients render
+        while the original leaked event stays on the relay. Posting nothing is
+        therefore the right failure direction here, and it is deliberately not
+        replicated into the sibling connectors, whose channels can be edited or
+        deleted. See ``_HIDDEN_CONTEXT_MARKERS`` for why this cannot fire on an
+        ordinary reply that merely talks about memory.
         """
         assert self._keys is not None
         key = (msg.chat_id, msg.thread_ts)
         now = int(time.time())
+        if marker := _hidden_context_marker(msg.text):
+            logger.error("[buzz] REFUSED to publish a reply carrying hidden model context (%s) to channel %s; this is a leak upstream of the connector, not a relay problem", marker, msg.chat_id)
+            if msg.is_final:
+                self._stream_targets.pop(key, None)
+                self._stream_tails.pop(key, None)
+            return
         chunks = _chunk_text(msg.text)
         target = self._stream_targets.get(key)
 

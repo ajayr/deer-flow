@@ -1696,3 +1696,200 @@ def test_membership_add_for_an_already_known_channel_does_not_re_run_discovery()
 
     assert len(_reqs_for(transport, "buzz-discovery")) == baseline
     assert ch._chat_subscriptions == {CHANNEL}
+
+
+# -- LIVE-TEST FINDING 2: `auth-required` during bootstrap is not a refusal --------
+#
+# The connector opens its control subscriptions immediately (in case the relay
+# serves unauthenticated reads), the relay CLOSEs them because NIP-42 auth has
+# not happened yet, and the auth branch then legitimately re-opens both. Live:
+#
+#   WARNING [buzz] relay closed control subscription buzz-discovery: auth-required: not authenticated
+#   WARNING [buzz] not re-opening buzz-discovery: the relay refused it. Channel
+#           discovery/membership tracking is down until the next reconnect or NIP-42 re-auth.
+#   ... discovery then completed, every channel was subscribed, and a live 44100
+#       for a brand-new channel was picked up seconds later.
+#
+# So the operator-facing warning stated an outage that demonstrably was not
+# happening. Pre-auth `auth-required` is now the expected bootstrap case (quiet,
+# and it does not spend the permanent-refusal path or the retry budget); the same
+# close AFTER a completed NIP-42 handshake is a genuine problem and stays loud.
+
+
+def test_pre_auth_auth_required_close_is_the_expected_bootstrap_case_not_a_refusal(caplog):
+    """The exact live sequence: control REQs go out pre-auth, the relay closes
+    them with `auth-required:`, the AUTH handshake completes, and both control
+    subscriptions come back. No permanent-refusal warning may be emitted, because
+    nothing is down."""
+    ch, _ = _started()
+    ws = ScriptedWS(
+        [
+            json.dumps(["CLOSED", "buzz-discovery", "auth-required: not authenticated"]),
+            json.dumps(["CLOSED", "buzz-membership", "auth-required: not authenticated"]),
+            '["AUTH","challenge-1"]',
+            json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)]),
+            '["EOSE","buzz-discovery"]',
+        ]
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        asyncio.run(ch._session(ws))
+
+    # Opened pre-auth, closed by the relay, re-opened wholesale by the auth branch.
+    assert len(_reqs_for(ws, "buzz-discovery")) == 2
+    assert len(_reqs_for(ws, "buzz-membership")) == 2
+    assert len(_reqs_for(ws, f"buzz-chat-{CHANNEL}")) == 1  # discovery ran and the channel was subscribed
+    assert ch._chat_subscriptions == set()  # cleared on session end, but it WAS listening
+    # The lie: nothing was down, so nothing may say it was.
+    assert "not re-opening" not in caplog.text
+    assert "discovery/membership tracking is down" not in caplog.text
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], f"pre-auth bootstrap must be quiet, got: {[r.getMessage() for r in warnings]}"
+
+
+def test_pre_auth_auth_required_close_does_not_spend_the_resubscribe_budget(monkeypatch):
+    """The retry budget protects the AUTHENTICATED session from a relay that keeps
+    closing a live subscription. A bootstrap close is recovered wholesale by the
+    auth branch and must not consume it."""
+    monkeypatch.setattr("app.channels.buzz.asyncio.sleep", AsyncMock())
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    for _ in range(MAX_RESUBSCRIBE_ATTEMPTS + 2):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-discovery", "auth-required: not authenticated"])))
+
+    assert ch._resubscribe_attempts == {}
+    assert _reqs_for(transport, "buzz-discovery") == []  # the auth branch re-opens it, not this path
+
+
+def test_post_auth_auth_required_close_is_still_treated_as_serious_and_logged_loudly(caplog):
+    """After the NIP-42 handshake completed, the relay demanding auth again is a
+    real problem: the subscription is genuinely down until a fresh AUTH challenge
+    or a reconnect, and the operator has to be told."""
+    ch, _ = _started()
+    ch._auth_completed = True
+    transport = FakeTransport()
+    ch._transport = transport
+
+    with caplog.at_level(logging.DEBUG, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-membership", "auth-required: not authenticated"])))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a post-auth auth-required close must be loud"
+    assert any("buzz-membership" in message for message in warnings)
+    assert _reqs_for(transport, "buzz-membership") == []  # still not fought over; re-auth is the recovery
+
+
+def test_post_auth_permanent_refusal_still_says_tracking_is_down(caplog):
+    """The truthful case the old wording was borrowed from: a non-auth permanent
+    refusal really does leave discovery/membership tracking down until reconnect."""
+    ch, _ = _started()
+    ch._auth_completed = True
+    ch._transport = FakeTransport()
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", "buzz-discovery", "restricted: not permitted"])))
+
+    assert "not re-opening" in caplog.text
+    assert "down until the next reconnect" in caplog.text
+
+
+def test_pre_auth_auth_required_close_of_a_chat_subscription_is_forgotten_so_auth_reopens_it(caplog):
+    """A chat REQ issued before auth can be closed the same way. It must be dropped
+    from the live set (so discovery re-opens it) without an UNLISTENED alarm."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    assert ch._chat_subscriptions == {CHANNEL}
+
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL}", "auth-required: not authenticated"])))
+
+    assert ch._chat_subscriptions == set()
+    assert len(_reqs_for(transport, f"buzz-chat-{CHANNEL}")) == 1  # not retried here; auth/discovery re-opens it
+    assert "UNLISTENED" not in caplog.text
+
+
+def test_auth_completed_flag_is_per_connection():
+    """It anchors "pre-auth" to THIS socket: a fresh connection starts unauthenticated
+    again, and a torn-down channel must not remember it was ever authenticated."""
+
+    async def run():
+        ch, _ = _started()
+        ch._auth_completed = True
+        await ch._session(ScriptedWS([]))
+        assert ch._auth_completed is False
+        ch._auth_completed = True
+        await ch._session(ScriptedWS(['["AUTH","challenge-1"]']))
+        assert ch._auth_completed is False
+
+    asyncio.run(run())
+
+
+def test_session_marks_auth_completed_once_the_nip42_handshake_is_sent():
+    ch, _ = _started()
+    seen = []
+    ws = ScriptedWS(['["AUTH","challenge-1"]'])
+    original = ch._open_control_subscriptions
+
+    async def spy(transport):
+        seen.append(ch._auth_completed)
+        await original(transport)
+
+    ch._open_control_subscriptions = spy
+    asyncio.run(ch._session(ws))
+    assert seen == [False, True]  # pre-auth open, then the post-AUTH re-open
+
+
+# -- FINDING 1 defense in depth: never publish DeerFlow's hidden model context -----
+#
+# The manager-side allowlist (`_accumulate_stream_text`) is the fix. This is the
+# second layer, and it lives here rather than in a sibling connector because on
+# Buzz a leak is PERMANENT: every streaming update is an immutable public Nostr
+# event, so a corrective edit only changes what clients render -- the original
+# leaked event stays on the relay forever.
+
+
+@pytest.mark.parametrize(
+    "leaked",
+    [
+        "<memory>\nFacts:\n- [context | 0.70] User interacts with the assistant through the DeerFlow chat channel.\n</memory>",
+        "<durable_context_data>\n## Conversation summary so far\nprivate\n</durable_context_data>",
+        "Sure! <system-reminder>Today is 2026-08-01</system-reminder>",
+    ],
+)
+def test_hidden_context_is_never_posted_to_the_relay(leaked, caplog):
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    with caplog.at_level(logging.ERROR, logger="app.channels.buzz"):
+        asyncio.run(ch.send(_outbound(ch, leaked, is_final=False)))
+
+    assert transport.sent == []
+    assert "hidden" in caplog.text.lower()
+
+
+def test_a_blocked_final_still_clears_the_stream_bookkeeping():
+    """Refusing to publish must not strand the placeholder, or the next run in this
+    conversation would edit an already-answered message."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.send(_outbound(ch, "working", is_final=False)))
+    assert (CHANNEL, None) in ch._stream_targets
+
+    asyncio.run(ch.send(_outbound(ch, "<memory>leak</memory>", is_final=True)))
+
+    assert ch._stream_targets == {} and ch._stream_tails == {}
+
+
+def test_ordinary_replies_that_merely_mention_the_words_are_still_published():
+    """The guard keys on DeerFlow's literal hidden-context wrappers, not on prose."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.send(_outbound(ch, "I stored that in memory and in the durable context data.", is_final=True)))
+    assert len(_events_of(transport)) == 1
