@@ -368,7 +368,7 @@ Buzz:
 - The frontend creates a short one-time code.
 - The UI shows `Send /connect <code> to the DeerFlow Buzz bot.`
 - The already-running Buzz relay-loop worker receives the message — sent as a DM or an @mention in a channel both parties belong to — and binds the sender's Nostr pubkey to the current DeerFlow user.
-- Requires the `buzz` dependency extra (`uv sync --extra buzz`) for the `coincurve` library.
+- Requires the `buzz` dependency extra (`uv sync --extra buzz`) for the `coincurve` library. `scripts/detect_uv_extras.py` (and Docker/production builds via `backend/Dockerfile`) auto-detect and preserve this extra when `channels.buzz.enabled: true` in `config.yaml`, the same way the `browser` extra is auto-detected for `browser_navigate`.
 
 ### Buzz subscription model
 
