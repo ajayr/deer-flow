@@ -3,6 +3,20 @@
 One NIP-42-authenticated WebSocket to ``relay_url``. Inbound kind-9 chat events are
 gated (pubkey allowlist, then mention/DM/thread-follow) and published to the bus;
 outbound replies post one kind-9 message and then stream via kind-40003 in-place edits.
+
+Subscriptions are CHANNEL-SCOPED, which is the shape the relay actually serves:
+
+- ``REQ {"kinds":[9]}`` (global) is accepted and answered with EOSE, but the relay
+  never fans a chat event out to it -- a connector subscribed that way authenticates
+  successfully and then receives nothing, forever. Proved against a live relay.
+- ``REQ {"kinds":[9], "#h":[uuid]}`` works, and a multi-value ``#h`` does NOT, so
+  there is exactly one chat subscription per channel (matching Buzz's own agent
+  harness, whose ``subscribe_channel_from`` is likewise per channel).
+
+So each connection: authenticate, discover the channels this identity belongs to
+with a historical ``kinds:[39000]`` REQ, open one ``#h`` chat subscription per
+discovered channel, and keep a live ``kinds:[44100,44101] #p=<us>`` subscription so
+channels we are added to (or removed from) later are picked up without a reconnect.
 """
 
 from __future__ import annotations
@@ -36,6 +50,23 @@ MAX_FUTURE_SKEW_SECONDS = 60
 # exemption for that channel until its metadata is seen again (``_is_dm`` fails
 # closed on a cache miss).
 MAX_CACHED_CHANNELS = 512
+
+# Cap on how many per-channel chat subscriptions one connection may hold. The
+# channel list is remote-fed (kind-39000 metadata and kind-44100 membership
+# notifications both come off the wire), and each entry is a real REQ on the socket,
+# so this is bounded twice over: well under buzz-relay's own per-connection ceiling
+# (``MAX_SUBSCRIPTIONS = 1024`` in its REQ handler) and far above any plausible
+# workspace. At the cap we REFUSE new subscriptions and log, rather than evicting an
+# existing one: eviction would silently deafen a channel that is currently working,
+# whereas refusing leaves every established channel intact and names the one that
+# did not fit.
+MAX_CHANNEL_SUBSCRIPTIONS = 256
+
+# Subscription ids. Deterministic so a subscription can be replaced or closed
+# individually (``CLOSE``) without disturbing the others on the same socket.
+DISCOVERY_SUB_ID = "buzz-discovery"
+MEMBERSHIP_SUB_ID = "buzz-membership"
+CHAT_SUB_PREFIX = "buzz-chat-"
 
 # Bound on how long ``stop()`` waits for the cancelled relay loop to finish.
 STOP_TIMEOUT_SECONDS = 5.0
@@ -97,8 +128,9 @@ class BuzzChannel(Channel):
         self._stream_targets: dict[tuple[str, str | None], str] = {}
         self._stream_tails: dict[tuple[str, str | None], list[str]] = {}  # overflow chunk ids beyond chunk 0, per conversation
         self._last_requester: dict[tuple[str, str | None], str] = {}
-        self._pending_auth_challenge: str | None = None  # set from an AUTH relay frame; consumed by Task 6's NIP-42 flow
-        self._seen_created_at: int = 0  # high-water mark of PROCESSED event created_at; Task 6 resubscribes with since=this
+        self._pending_auth_challenge: str | None = None  # set from an AUTH relay frame; consumed by the NIP-42 flow in _session
+        self._seen_created_at: dict[str, int] = {}  # channel id -> high-water mark of PROCESSED created_at (see _advance_watermark)
+        self._chat_subscriptions: set[str] = set()  # channel ids with a live per-channel REQ on the CURRENT connection
         self._transport: Any = None
         self._task: asyncio.Task | None = None
         self._publish = self.bus.publish_inbound  # test seam (discord.py idiom)
@@ -148,10 +180,13 @@ class BuzzChannel(Channel):
           and the timeout is logged instead of passing silently.
 
         Per-connection bookkeeping (stream placeholders, overflow tails, last
-        requester, half-consumed auth challenge, remote-fed channel metadata) is
-        also cleared: those maps key on relay event ids from the session being
-        torn down, so a later ``start()`` must not resume editing placeholders
-        from a previous process lifetime.
+        requester, half-consumed auth challenge, remote-fed channel metadata,
+        per-channel chat subscriptions) is also cleared: those maps key on relay
+        event ids and subscription ids from the session being torn down, so a
+        later ``start()`` must not resume editing placeholders -- or believe it is
+        still subscribed to anything -- from a previous process lifetime. The
+        per-channel replay cursors (``_seen_created_at``) deliberately survive, so
+        a restart resumes where it left off instead of replaying every channel.
         """
         if not self._running:
             return
@@ -181,58 +216,164 @@ class BuzzChannel(Channel):
         self._stream_tails.clear()
         self._last_requester.clear()
         self._channel_meta.clear()
+        self._chat_subscriptions.clear()
         self._pending_auth_challenge = None
         logger.info("[buzz] channel stopped")
 
-    def _subscription_filters(self) -> list[dict]:
-        """NIP-01 REQ filters for our one subscription: member chat plus channel metadata.
+    # -- subscriptions ------------------------------------------------------
 
-        ``since`` rides on the chat filter only when we have a watermark
-        (``_seen_created_at``, advanced by ``_advance_watermark``): on a fresh
-        channel this is 0 (no watermark yet, so no ``since`` -- the relay's default
-        backlog applies), and on every reconnect afterwards it is the newest
-        ``created_at`` we have already processed, so re-subscribing after a drop
-        does not replay the entire channel history nor silently skip events
-        published while we were disconnected.
+    @staticmethod
+    def _chat_sub_id(channel_id: str) -> str:
+        return f"{CHAT_SUB_PREFIX}{channel_id}"
 
-        "Processed" now means accepted-and-published (or a fully handled
-        ``/connect``), never merely received. That is strictly safer for the
-        skip direction: the cursor can only ever be lower than it would have been
-        under the old advance-on-everything rule, so any event the old cursor
-        would have covered is still covered. What it costs is replay -- events we
-        already dropped come back after a reconnect and are dropped again by the
-        same gates, which is idempotent -- plus one guaranteed redelivery of the
-        boundary event itself, since NIP-01 ``since`` is inclusive; the manager's
-        inbound dedupe (keyed on our ``event_id`` metadata within this workspace)
-        is what keeps that from starting a second run.
+    def _chat_filter(self, channel_id: str) -> dict:
+        """The NIP-01 filter for ONE channel's chat subscription.
+
+        ``#h`` is not an optimization -- it is the only shape the relay fans kind-9
+        events out to (see the module docstring), and it may carry exactly one value.
+
+        ``since`` rides along only once we have a watermark for THIS channel
+        (``_seen_created_at``, advanced by ``_advance_watermark``): a channel we
+        have not processed anything in yet gets no ``since``, so the relay's default
+        backlog applies, and afterwards it is the newest ``created_at`` we have
+        already processed in that channel -- so re-subscribing after a drop neither
+        replays the whole channel nor silently skips what was published while we
+        were disconnected.
+
+        "Processed" means accepted-and-published (or a fully handled ``/connect``),
+        never merely received. That is strictly safer for the skip direction: the
+        cursor can only ever be lower than it would have been under an
+        advance-on-everything rule, so any event that rule would have covered is
+        still covered. What it costs is replay -- events we already dropped come
+        back after a reconnect and are dropped again by the same gates, which is
+        idempotent -- plus one guaranteed redelivery of the boundary event itself,
+        since NIP-01 ``since`` is inclusive; the manager's inbound dedupe (keyed on
+        our ``event_id`` metadata within this workspace) is what keeps that from
+        starting a second run.
         """
-        chat_filter: dict = {"kinds": [buzz_nostr.KIND_CHAT]}
-        if self._seen_created_at:
-            chat_filter["since"] = self._seen_created_at
-        return [chat_filter, {"kinds": [buzz_nostr.KIND_CHANNEL_META]}]
+        chat_filter: dict = {"kinds": [buzz_nostr.KIND_CHAT], "#h": [channel_id]}
+        since = self._seen_created_at.get(channel_id)
+        if since:
+            chat_filter["since"] = since
+        return chat_filter
+
+    def _discovery_filter(self) -> dict:
+        """Historical kind-39000 query: which channels is this identity a member of?
+
+        Deliberately unfiltered beyond the kind. The relay scopes kind-39000 by
+        membership itself, returning one stored event per channel we belong to
+        followed by EOSE -- adding ``#p`` (an obvious-looking narrowing) matches
+        nothing and returns zero channels, verified against a live relay.
+        """
+        return {"kinds": [buzz_nostr.KIND_CHANNEL_META]}
+
+    def _membership_filter(self) -> dict:
+        """Live membership notifications addressed to us: added to / removed from a channel."""
+        assert self._keys is not None
+        return {"kinds": [buzz_nostr.KIND_MEMBER_ADDED, buzz_nostr.KIND_MEMBER_REMOVED], "#p": [self._keys.pubkey_hex]}
+
+    async def _open_control_subscriptions(self, ws) -> None:
+        """Channel discovery plus membership notifications: the two per-connection subscriptions."""
+        await ws.send(buzz_nostr.req_frame(DISCOVERY_SUB_ID, self._discovery_filter()))
+        await ws.send(buzz_nostr.req_frame(MEMBERSHIP_SUB_ID, self._membership_filter()))
+
+    async def _ensure_chat_subscription(self, channel_id: str) -> None:
+        """Open this channel's chat subscription unless it is already open on this connection.
+
+        Never raises: it runs from the relay read loop, where a failed REQ must not
+        take down the connection. A failure simply leaves the channel unsubscribed
+        and out of ``_chat_subscriptions``, so the discovery EOSE sweep (or the next
+        kind-39000 for it, or a reconnect) retries.
+        """
+        if not channel_id or channel_id in self._chat_subscriptions:
+            return
+        transport = self._transport
+        if transport is None:
+            return  # no connection: subscriptions are per-socket and are rebuilt by _session
+        if len(self._chat_subscriptions) >= MAX_CHANNEL_SUBSCRIPTIONS:
+            logger.warning("[buzz] per-channel subscription limit reached (%d); not listening to channel %s", MAX_CHANNEL_SUBSCRIPTIONS, channel_id)
+            return
+        try:
+            await transport.send(buzz_nostr.req_frame(self._chat_sub_id(channel_id), self._chat_filter(channel_id)))
+        except Exception:
+            logger.warning("[buzz] failed to subscribe to channel %s; will retry", channel_id, exc_info=True)
+            return
+        self._chat_subscriptions.add(channel_id)
+        logger.info("[buzz] listening to channel %s (%s)", self._channel_meta.get(channel_id, {}).get("name") or "<unnamed>", channel_id)
+
+    async def _close_chat_subscription(self, channel_id: str) -> None:
+        """Stop listening to one channel, leaving every other subscription on this socket alone."""
+        if channel_id not in self._chat_subscriptions:
+            return
+        self._chat_subscriptions.discard(channel_id)
+        transport = self._transport
+        if transport is None:
+            return
+        try:
+            await transport.send(buzz_nostr.close_frame(self._chat_sub_id(channel_id)))
+        except Exception:
+            logger.warning("[buzz] failed to unsubscribe from channel %s", channel_id, exc_info=True)
+
+    def _forget_subscription(self, sub_id: str) -> None:
+        """A ``CLOSED`` frame means the relay dropped this subscription (e.g. the channel
+        was archived and access revoked). Forgetting it is what lets a later kind-44100
+        -- or the next discovery pass -- actually re-open it instead of no-opping."""
+        if sub_id.startswith(CHAT_SUB_PREFIX):
+            self._chat_subscriptions.discard(sub_id[len(CHAT_SUB_PREFIX) :])
+
+    async def _on_discovery_complete(self) -> None:
+        """EOSE for the discovery subscription: every channel we belong to has now been sent.
+
+        Chat subscriptions are opened as each kind-39000 arrives, so this is normally
+        a no-op sweep. It exists because that is the point where the result can be
+        relied on: a channel whose REQ failed mid-discovery is retried here, and a
+        connector that discovered nothing is called out rather than sitting silent.
+
+        The sweep runs over the whole metadata cache rather than only what this
+        connection discovered, which can re-subscribe to a channel we were removed
+        from while disconnected (kind-44101 prunes the cache, but only if we were
+        connected to receive it). That is self-correcting and deliberately not
+        engineered around: the relay answers with ``CLOSED``, which
+        ``_forget_subscription`` drops, so the cost is one REQ per stale channel per
+        reconnect and never a wrong-channel message -- the allowlist and signature
+        gates are what decide whether anything is acted on.
+        """
+        for channel_id in list(self._channel_meta):
+            await self._ensure_chat_subscription(channel_id)
+        if self._chat_subscriptions:
+            logger.info("[buzz] channel discovery complete: listening to %d channel(s)", len(self._chat_subscriptions))
+        else:
+            logger.warning("[buzz] channel discovery returned no channels: this identity is not a member of any channel on %s (add it with `buzz channels add-member`)", self._relay_url)
 
     async def _session(self, ws) -> None:
-        """Run one relay connection's lifetime: subscribe, authenticate if challenged, read frames.
+        """Run one relay connection's lifetime: authenticate, discover, subscribe, read frames.
 
         ``self._transport`` is set for the duration of this connection so ``send()``
         / ``_post_event()`` can post outbound events on it, and is unconditionally
         cleared in ``finally`` on the way out -- including on error -- so a stale
         reference can never survive past this connection (``_post_event`` reads it
         fresh on every call and raises when it is ``None``; see its docstring).
+        ``_chat_subscriptions`` is per-socket bookkeeping and is cleared alongside
+        it, so the next connection re-sends every REQ instead of believing
+        subscriptions from a dead socket are still live.
 
-        NIP-42 auth is opportunistic, not upfront: the initial REQ is sent
-        immediately in case the relay allows unauthenticated reads, but
+        NIP-42 auth is opportunistic, not upfront: discovery/membership REQs are
+        sent immediately in case the relay allows unauthenticated reads, but
         ``handle_relay_frame`` records any ``AUTH`` challenge the relay sends onto
         ``self._pending_auth_challenge``, and this loop reacts to it the next time
-        around by signing and sending the AUTH event and then RESUBSCRIBING --
-        our relay is closed, so the pre-auth REQ may have been silently rejected,
-        and without resubscribing we would end up authenticated but listening to
-        nothing. A fresh challenge is per-connection (the relay mints a new one on
-        every new socket), so this runs again from scratch on every reconnect.
+        around by signing and sending the AUTH event and then RE-RUNNING DISCOVERY
+        -- our relay is closed, so the pre-auth REQs may have been rejected, and
+        without redoing them we would end up authenticated but listening to nothing.
+        The per-channel subscription set is dropped at the same moment for the same
+        reason: a chat REQ issued pre-auth may have been rejected too, so it must
+        not be remembered as live. A fresh challenge is per-connection (the relay
+        mints a new one on every new socket), so all of this runs again from
+        scratch on every reconnect.
         """
         self._transport = ws
+        self._chat_subscriptions.clear()
         try:
-            await ws.send(buzz_nostr.req_frame("buzz-main", *self._subscription_filters()))
+            await self._open_control_subscriptions(ws)
             async for raw in ws:
                 await self.handle_relay_frame(raw)
                 if self._pending_auth_challenge is not None:
@@ -241,10 +382,11 @@ class BuzzChannel(Channel):
                     self._pending_auth_challenge = None
                     auth = buzz_nostr.build_auth_event(self._keys, self._relay_url, challenge, created_at=int(time.time()))
                     await ws.send(json.dumps(["AUTH", auth], separators=(",", ":")))
-                    # Re-subscribe post-auth: the pre-auth REQ may have been rejected on closed relays.
-                    await ws.send(buzz_nostr.req_frame("buzz-main", *self._subscription_filters()))
+                    self._chat_subscriptions.clear()
+                    await self._open_control_subscriptions(ws)
         finally:
             self._transport = None
+            self._chat_subscriptions.clear()
 
     async def _run_loop(self) -> None:
         """Own the relay connection for the channel's lifetime: connect, run one session, retry forever.
@@ -340,25 +482,40 @@ class BuzzChannel(Channel):
         kind = frame[0]
         if kind == "AUTH" and len(frame) >= 2:
             self._pending_auth_challenge = str(frame[1])
+        elif kind == "EOSE" and len(frame) >= 2 and frame[1] == DISCOVERY_SUB_ID:
+            await self._on_discovery_complete()
+        elif kind == "CLOSED" and len(frame) >= 2:
+            logger.info("[buzz] relay closed subscription %s: %s", frame[1], frame[2] if len(frame) >= 3 else "")
+            self._forget_subscription(str(frame[1]))
         elif kind == "EVENT" and len(frame) >= 3 and isinstance(frame[2], dict):
             ev = frame[2]
             if not buzz_nostr.verify_event(ev):
                 logger.warning("[buzz] dropped relay event with an invalid id/signature (claimed pubkey=%s kind=%s)", ev.get("pubkey"), ev.get("kind"))
                 return
             try:
-                if ev.get("kind") == buzz_nostr.KIND_CHANNEL_META:
-                    self._handle_meta_event(ev)
-                elif ev.get("kind") == buzz_nostr.KIND_CHAT:
+                ev_kind = ev.get("kind")
+                if ev_kind == buzz_nostr.KIND_CHANNEL_META:
+                    channel_id = self._handle_meta_event(ev)
+                    if channel_id:
+                        await self._ensure_chat_subscription(channel_id)
+                elif ev_kind == buzz_nostr.KIND_CHAT:
                     await self._handle_chat_event(ev)
+                elif ev_kind in (buzz_nostr.KIND_MEMBER_ADDED, buzz_nostr.KIND_MEMBER_REMOVED):
+                    await self._handle_membership_event(ev)
             except Exception:
                 # Defense in depth against malformed tags/timestamps inside an
                 # otherwise well-shaped EVENT frame (e.g. a non-integer created_at,
                 # or a "tags" field that isn't a list of [name, value, ...] lists).
                 logger.warning("[buzz] malformed relay event ignored", exc_info=True)
-        # OK / EOSE / NOTICE frames need no action
+        # OK / other EOSE / NOTICE frames need no action
 
-    def _handle_meta_event(self, ev: dict) -> None:
+    def _handle_meta_event(self, ev: dict) -> str | None:
         """Cache kind-39000 channel metadata: ``d`` = channel id, ``t`` = type, ``name``.
+
+        Returns the channel id it cached (or ``None``), because kind-39000 is also
+        the channel-DISCOVERY event: the caller turns each one into that channel's
+        chat subscription. The two uses share one handler on purpose -- the set of
+        channels we hold metadata for is exactly the set we are a member of.
 
         Trust assumption (authorship, not authenticity): ``handle_relay_frame``
         has already proved this event really was signed by the pubkey it names,
@@ -383,7 +540,7 @@ class BuzzChannel(Channel):
         """
         d_values = buzz_nostr.tag_values(ev, "d")
         if not d_values:
-            return
+            return None
         names = buzz_nostr.tag_values(ev, "name")
         types = buzz_nostr.tag_values(ev, "t")
         channel_id = d_values[0]
@@ -392,6 +549,64 @@ class BuzzChannel(Channel):
         while len(self._channel_meta) > MAX_CACHED_CHANNELS:
             self._channel_meta.pop(next(iter(self._channel_meta)))
         logger.debug("[buzz] channel metadata cached: %s (%s) type=%s", meta["name"] or "<unnamed>", channel_id, meta["type"])
+        return channel_id
+
+    async def _handle_membership_event(self, ev: dict) -> None:
+        """React to a relay-signed kind-44100 / kind-44101 membership notification.
+
+        This is what makes a newly added channel work WITHOUT a reconnect: the relay
+        publishes one of these (``p`` = the affected member, ``h`` = the channel
+        uuid) on the membership subscription opened for every connection, so being
+        added to a channel is a live event rather than something we would only
+        notice the next time the socket happened to drop.
+
+        The ``#p`` filter on the subscription is the relay's claim, not a proof, so
+        the ``p`` tag is re-checked here: another member's membership change must
+        never make us subscribe to a channel we do not belong to. (The event's
+        signature is already verified at ``handle_relay_frame``; what is trusted, as
+        for kind-39000, is that the signer is the relay -- see the class docstring's
+        trust model. A member who forges one can at most make us open a subscription
+        the relay will refuse or answer with nothing.)
+
+        Removal drops the cached metadata too: the entry would otherwise keep the
+        channel in the discovery-EOSE sweep and make every later reconnect
+        re-subscribe to a channel we have been thrown out of.
+        """
+        assert self._keys is not None
+        if self._keys.pubkey_hex not in buzz_nostr.tag_values(ev, "p"):
+            return  # someone else's membership change
+        channel_ids = buzz_nostr.tag_values(ev, "h")
+        if not channel_ids:
+            return
+        channel_id = channel_ids[0]
+        if ev.get("kind") == buzz_nostr.KIND_MEMBER_ADDED:
+            logger.info("[buzz] added to channel %s; subscribing", channel_id)
+            # Subscribe first so no message is missed while metadata catches up, then
+            # re-run discovery: the new channel's name and type (which drives the DM
+            # mention exemption) are only carried by its kind-39000 event.
+            await self._ensure_chat_subscription(channel_id)
+            await self._refresh_channel_discovery()
+        else:
+            logger.info("[buzz] removed from channel %s; unsubscribing", channel_id)
+            await self._close_chat_subscription(channel_id)
+            self._channel_meta.pop(channel_id, None)
+
+    async def _refresh_channel_discovery(self) -> None:
+        """Re-issue the discovery REQ on its existing subscription id.
+
+        Replaces the subscription in place, so the relay re-sends every kind-39000
+        it holds for us: metadata for the new channel arrives, and each event runs
+        through ``_ensure_chat_subscription``, which is a no-op for channels already
+        subscribed. Cheaper to reason about than a one-off narrowed query, and it
+        reconciles anything else that changed while we were connected.
+        """
+        transport = self._transport
+        if transport is None:
+            return
+        try:
+            await transport.send(buzz_nostr.req_frame(DISCOVERY_SUB_ID, self._discovery_filter()))
+        except Exception:
+            logger.warning("[buzz] failed to refresh channel discovery", exc_info=True)
 
     def _is_dm(self, channel_id: str) -> bool:
         """True only when metadata was positively cached as ``type == "dm"``.
@@ -496,15 +711,22 @@ class BuzzChannel(Channel):
         except Exception:
             logger.warning("[buzz] failed to send /connect reply to pubkey=%s", author)
 
-    def _advance_watermark(self, created_at: int) -> None:
-        """Move the resubscribe cursor to *created_at*, refusing peer-supplied future timestamps.
+    def _advance_watermark(self, channel_id: str, created_at: int) -> None:
+        """Move THIS CHANNEL's resubscribe cursor to *created_at*, refusing future timestamps.
 
-        ``created_at`` is chosen by the event's author, and ``_subscription_filters``
-        replays it as ``since`` on every reconnect. Accepting it unchecked was a
-        remote denial of service: one event stamped year-5138 pinned the cursor
-        there, so every subsequent REQ asked for events newer than that and the
-        connector went permanently deaf with no log and no recovery short of a
-        process restart.
+        The cursor is per channel because subscriptions are: a single global
+        watermark is the newest event processed in ANY channel, so a busy channel
+        would keep dragging it forward and a quiet channel's next REQ would ask for
+        events newer than traffic that never belonged to it -- silently skipping
+        everything published in the quiet channel while we were disconnected. That
+        is the one direction this cursor must never fail in. Per channel costs one
+        integer per channel and cannot skip.
+
+        ``created_at`` is chosen by the event's author, and ``_chat_filter`` replays
+        it as ``since`` on every reconnect. Accepting it unchecked was a remote
+        denial of service: one event stamped year-5138 pinned the cursor there, so
+        every subsequent REQ asked for events newer than that and the connector went
+        permanently deaf with no log and no recovery short of a process restart.
 
         The cursor therefore never moves beyond ``now + MAX_FUTURE_SKEW_SECONDS``.
         An out-of-range timestamp is IGNORED rather than clamped down to the
@@ -512,14 +734,21 @@ class BuzzChannel(Channel):
         the slack, while ignoring leaves the cursor where the last plausible event
         put it. A legitimately fast-clocked member merely fails to advance the
         cursor, which costs replay (drops we re-apply) and never a miss.
+
+        Channel ids arrive in remote ``h`` tags, so the map is remote-fed and capped
+        the same way ``_channel_meta`` is. Eviction is safe by construction: a
+        channel with no cursor simply re-subscribes without ``since`` and gets the
+        relay's default backlog, i.e. eviction can only ever cost replay.
         """
-        if created_at <= 0:
+        if created_at <= 0 or not channel_id:
             return
         ceiling = int(time.time()) + MAX_FUTURE_SKEW_SECONDS
         if created_at > ceiling:
             logger.debug("[buzz] ignoring future-dated created_at=%d for the resubscribe cursor (ceiling=%d)", created_at, ceiling)
             return
-        self._seen_created_at = max(self._seen_created_at, created_at)
+        self._seen_created_at[channel_id] = max(self._seen_created_at.get(channel_id, 0), created_at)
+        while len(self._seen_created_at) > MAX_CACHED_CHANNELS:
+            self._seen_created_at.pop(next(iter(self._seen_created_at)))
 
     async def _attach_connection_identity(self, inbound: InboundMessage) -> InboundMessage:
         """Resolve a persisted ``/connect`` binding for this pubkey, exactly as every sibling does.
@@ -568,7 +797,7 @@ class BuzzChannel(Channel):
             # A bind attempt (valid or not) is fully processed, so it may advance the
             # cursor: leaving it behind would replay this /connect on every reconnect
             # and answer each replay with a spurious "code invalid or expired" reply.
-            self._advance_watermark(created_at)
+            self._advance_watermark(channel_id, created_at)
             return
         if author not in self._allowed_users:
             # Deny-by-default is intentional (see start()'s empty-allowlist warning),
@@ -601,7 +830,7 @@ class BuzzChannel(Channel):
         # Only a fully accepted-and-published event advances the cursor, and only
         # after the publish actually succeeded. A dropped event must never move it
         # (that was the DoS), and a failed publish must leave it replayable.
-        self._advance_watermark(created_at)
+        self._advance_watermark(channel_id, created_at)
 
     # -- outbound --------------------------------------------------------------
 

@@ -82,6 +82,19 @@ def test_frames_serialize_as_nostr_wire_arrays():
     assert req == ["REQ", "sub1", {"kinds": [9]}, {"kinds": [39000]}]
     ev = buzz_nostr.build_chat_event(_keys(), CHANNEL, "x", created_at=1700000004)
     assert json.loads(buzz_nostr.event_frame(ev)) == ["EVENT", ev]
+    assert json.loads(buzz_nostr.close_frame("sub1")) == ["CLOSE", "sub1"]
+
+
+def test_close_frame_targets_exactly_one_subscription():
+    """Restored for per-channel subscriptions: being removed from one channel must
+    unsubscribe that channel alone, leaving the discovery/membership subscriptions
+    and every other channel's subscription on the same socket untouched."""
+    assert json.loads(buzz_nostr.close_frame(f"buzz-chat-{CHANNEL}")) == ["CLOSE", f"buzz-chat-{CHANNEL}"]
+
+
+def test_membership_notification_kinds_match_buzz_core():
+    """Pinned against buzz-core/src/kind.rs (KIND_MEMBER_*_NOTIFICATION)."""
+    assert (buzz_nostr.KIND_MEMBER_ADDED, buzz_nostr.KIND_MEMBER_REMOVED) == (44100, 44101)
 
 
 def test_tag_values_extracts_all_matching_tags():

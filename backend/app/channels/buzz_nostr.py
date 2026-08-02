@@ -108,6 +108,12 @@ KIND_CHAT = 9
 KIND_EDIT = 40003
 KIND_AUTH = 22242
 KIND_CHANNEL_META = 39000
+# Relay-signed membership notifications (buzz-core's KIND_MEMBER_ADDED_NOTIFICATION /
+# KIND_MEMBER_REMOVED_NOTIFICATION). Each carries ``p`` = the affected member's pubkey
+# and ``h`` = the channel uuid, which is how a connected client learns it was added to
+# (or removed from) a channel without reconnecting.
+KIND_MEMBER_ADDED = 44100
+KIND_MEMBER_REMOVED = 44101
 
 
 def build_auth_event(keys: NostrKeys, relay_url: str, challenge: str, created_at: int) -> dict:
@@ -177,6 +183,18 @@ def req_frame(sub_id: str, *filters: dict) -> str:
 
 def event_frame(event: dict) -> str:
     return json.dumps(["EVENT", event], separators=(",", ":"))
+
+
+def close_frame(sub_id: str) -> str:
+    """NIP-01 ``CLOSE``: stop an individual subscription without dropping the socket.
+
+    Needed because chat subscriptions are per channel (the relay only fans kind-9
+    events out to ``#h``-scoped subscriptions), so being removed from a channel has
+    to unsubscribe exactly that one -- the other channels' subscriptions, the
+    discovery subscription, and the membership subscription all ride the same
+    connection and must survive.
+    """
+    return json.dumps(["CLOSE", sub_id], separators=(",", ":"))
 
 
 def tag_values(event: dict, name: str) -> list[str]:

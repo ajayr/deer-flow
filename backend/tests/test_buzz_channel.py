@@ -11,7 +11,7 @@ pytest.importorskip("coincurve")
 
 from app.channels import buzz_nostr
 from app.channels.base import Channel
-from app.channels.buzz import EDIT_MAX_BYTES, MAX_CACHED_CHANNELS, BuzzChannel, _chunk_text
+from app.channels.buzz import EDIT_MAX_BYTES, MAX_CACHED_CHANNELS, MAX_CHANNEL_SUBSCRIPTIONS, BuzzChannel, _chunk_text
 from app.channels.manager import CHANNEL_CAPABILITIES
 from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMessage
 from app.channels.run_policy import CHANNEL_RUN_POLICY
@@ -27,10 +27,14 @@ PK3_HEX = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
 SK_OWNER = "0000000000000000000000000000000000000000000000000000000000000005"
 SK_OUTSIDER = "0000000000000000000000000000000000000000000000000000000000000007"
 SK_NEWCOMER = "0000000000000000000000000000000000000000000000000000000000000009"
+# The relay's own keypair: it signs kind-39000 channel discovery events and the
+# kind-44100/44101 membership notifications (buzz-relay's `state.relay_keypair`).
+SK_RELAY = "000000000000000000000000000000000000000000000000000000000000000b"
 OWNER = buzz_nostr.parse_private_key(SK_OWNER).pubkey_hex  # the one allowlisted author
 OUTSIDER = buzz_nostr.parse_private_key(SK_OUTSIDER).pubkey_hex  # relay member, not allowlisted
 NEWCOMER = buzz_nostr.parse_private_key(SK_NEWCOMER).pubkey_hex  # not allowlisted; binds via /connect
 CHANNEL = "136852ee-63e1-49c2-8927-413b5ee8e5f7"
+CHANNEL_B = "5e0209b6-2d67-5a2e-894c-9ea597f17202"
 
 
 def _channel(**overrides) -> BuzzChannel:
@@ -166,6 +170,24 @@ def _event(*, sk=SK_OWNER, kind=9, content="@DeerFlow hello", channel=CHANNEL, m
     return buzz_nostr.sign_event(buzz_nostr.parse_private_key(sk), kind, tags, content, created_at)
 
 
+def _meta_event(channel=CHANNEL, *, name="general", channel_type="stream", sk=SK_RELAY, created_at=1700000060):
+    """A real kind-39000 channel-discovery event, shaped exactly like buzz-relay's.
+
+    Verified against the live relay: `d` = channel uuid, `name` = channel name,
+    `t` = channel type (`stream` / `dm`), signed by the relay keypair."""
+    return buzz_nostr.sign_event(buzz_nostr.parse_private_key(sk), buzz_nostr.KIND_CHANNEL_META, [["d", channel], ["name", name], ["t", channel_type]], "", created_at)
+
+
+def _membership_event(kind, channel=CHANNEL, *, target=PK3_HEX, sk=SK_RELAY, created_at=1700000070):
+    """A real kind-44100/44101 membership notification, shaped like buzz-relay's.
+
+    Verified against the live relay: `p` = the affected member's pubkey, `h` = the
+    channel uuid, content = a JSON blob naming the actor. Relay-signed."""
+    event_type = "member_added" if kind == buzz_nostr.KIND_MEMBER_ADDED else "member_removed"
+    content = json.dumps({"type": event_type, "channel_id": channel, "actor": OWNER})
+    return buzz_nostr.sign_event(buzz_nostr.parse_private_key(sk), kind, [["p", target], ["h", channel]], content, created_at)
+
+
 def _started(**overrides):
     ch = _channel(**overrides)
     ch._keys = buzz_nostr.parse_private_key(SK3_HEX)
@@ -235,7 +257,7 @@ def test_thread_replies_map_topic_and_requester_and_watermark():
     _dispatch(ch, _event(reply_to="aa" * 32, created_at=1700000200))
     assert captured[0].topic_id == "aa" * 32 and captured[0].thread_ts == "aa" * 32
     assert ch._last_requester[(CHANNEL, "aa" * 32)] == OWNER
-    assert ch._seen_created_at == 1700000200
+    assert ch._seen_created_at[CHANNEL] == 1700000200
 
 
 def test_auth_frame_records_challenge_and_meta_defaults_fail_closed():
@@ -624,10 +646,21 @@ class ScriptedWS:
         return False
 
 
-def test_session_authenticates_then_subscribes_with_since_cursor():
+def test_session_authenticates_then_subscribes_per_discovered_channel_with_since_cursor():
+    """Rewritten for the live-test finding (see the per-channel section below).
+
+    The original version of this test asserted the buggy shape: a GLOBAL
+    `{"kinds":[9], "since": ...}` filter with no `#h`. The relay accepts that REQ
+    and answers EOSE, but never fans a single chat event out to it, so the
+    connector connected, authenticated, and stayed permanently silent. The
+    assertions are otherwise unchanged in strength -- NIP-42 auth still happens,
+    a kind-39000 discovery subscription is still opened, and the `since`
+    watermark still rides the chat filter -- but that chat filter must now be
+    `#h`-scoped to a channel we actually discovered.
+    """
     ch, _ = _started()
-    ch._seen_created_at = 1700000500
-    ws = ScriptedWS(['["AUTH","challenge-1"]'])
+    ch._seen_created_at[CHANNEL] = 1700000500
+    ws = ScriptedWS(['["AUTH","challenge-1"]', json.dumps(["EVENT", "buzz-discovery", _meta_event()]), '["EOSE","buzz-discovery"]'])
 
     asyncio.run(ch._session(ws))
     auth_frames = [f for f in ws.sent if f[0] == "AUTH"]
@@ -635,9 +668,11 @@ def test_session_authenticates_then_subscribes_with_since_cursor():
     assert len(auth_frames) == 1 and auth_frames[0][1]["kind"] == 22242
     assert ["challenge", "challenge-1"] in auth_frames[0][1]["tags"]
     assert req_frames, "expected a REQ subscription"
-    kinds = [f0 for f in req_frames for f0 in f[2:] if isinstance(f0, dict)]
-    assert any(9 in f.get("kinds", []) and f.get("since") == 1700000500 for f in kinds)
-    assert any(39000 in f.get("kinds", []) for f in kinds)
+    filters = [f0 for f in req_frames for f0 in f[2:] if isinstance(f0, dict)]
+    assert any(39000 in f.get("kinds", []) for f in filters)
+    assert any(9 in f.get("kinds", []) and f.get("#h") == [CHANNEL] and f.get("since") == 1700000500 for f in filters)
+    # ... and never the global kind-9 filter the relay silently ignores.
+    assert not [f for f in filters if 9 in f.get("kinds", []) and not f.get("#h")]
 
 
 def test_session_routes_events_through_handle_relay_frame():
@@ -793,8 +828,8 @@ def test_future_dated_event_from_a_dropped_author_never_moves_the_cursor():
     ch, captured = _started()
     _dispatch(ch, _event(sk=SK_OUTSIDER, created_at=99999999999999))
     assert captured == []
-    assert ch._seen_created_at == 0
-    assert all("since" not in f for f in ch._subscription_filters())
+    assert ch._seen_created_at == {}
+    assert "since" not in ch._chat_filter(CHANNEL)
 
 
 def test_future_dated_event_from_an_allowlisted_author_is_delivered_but_capped():
@@ -804,7 +839,7 @@ def test_future_dated_event_from_an_allowlisted_author_is_delivered_but_capped()
     ch, captured = _started()
     _dispatch(ch, _event(created_at=99999999999999))
     assert len(captured) == 1
-    assert ch._seen_created_at == 0
+    assert ch._seen_created_at == {}
 
 
 def test_dropped_event_with_a_plausible_timestamp_also_leaves_the_cursor_alone():
@@ -813,15 +848,15 @@ def test_dropped_event_with_a_plausible_timestamp_also_leaves_the_cursor_alone()
     ch, captured = _started()
     _dispatch(ch, _event(sk=SK_OUTSIDER, created_at=1700000400))
     assert captured == []
-    assert ch._seen_created_at == 0
+    assert ch._seen_created_at == {}
 
 
 def test_accepted_event_advances_the_cursor_and_rides_the_next_subscription():
     ch, captured = _started()
     _dispatch(ch, _event(created_at=1700000300))
     assert len(captured) == 1
-    assert ch._seen_created_at == 1700000300
-    assert ch._subscription_filters()[0]["since"] == 1700000300
+    assert ch._seen_created_at[CHANNEL] == 1700000300
+    assert ch._chat_filter(CHANNEL)["since"] == 1700000300
 
 
 def test_a_handled_connect_advances_the_cursor_but_a_forged_one_does_not():
@@ -832,12 +867,12 @@ def test_a_handled_connect_advances_the_cursor_but_a_forged_one_does_not():
     ch, _ = _started(connection_repo=repo)
     ch._transport = FakeTransport()
     _dispatch(ch, _event(sk=SK_NEWCOMER, content="/connect tok-cursor", mentions=(), created_at=1700000250))
-    assert ch._seen_created_at == 1700000250
+    assert ch._seen_created_at[CHANNEL] == 1700000250
 
     forged = _event(sk=SK_OUTSIDER, content="/connect tok-cursor", mentions=(), created_at=1700000600)
     forged["content"] = "/connect tok-cursor-tampered"  # breaks the signature
     _dispatch(ch, forged)
-    assert ch._seen_created_at == 1700000250
+    assert ch._seen_created_at[CHANNEL] == 1700000250
 
 
 # -- FINAL REVIEW FINDING 2 (Important): /connect binds were never resolved inbound --
@@ -1097,3 +1132,273 @@ def test_channel_metadata_cache_is_bounded_against_remote_feeding():
     assert len(ch._channel_meta) == MAX_CACHED_CHANNELS
     assert "chan-0" not in ch._channel_meta  # oldest evicted first
     assert f"chan-{MAX_CACHED_CHANNELS + 24}" in ch._channel_meta
+
+
+# -- LIVE-TEST FINDING: the relay only fans out to channel-scoped subscriptions ----
+#
+# Proved against a real Buzz relay (wss://buzz.atg.one), with a second identity
+# publishing into a channel the connector is a member of, while both subscription
+# shapes were open on the same authenticated socket:
+#
+#   REQ {"kinds":[9]}                      -> accepted, EOSE, and ZERO live events
+#   REQ {"kinds":[9], "#h":[uuid]}         -> the event arrives
+#   REQ {"kinds":[9], "#h":[uuid-a,uuid-b]}-> ZERO events (so one REQ per channel)
+#
+# The connector therefore has to discover its channels (historical kind-39000 REQ)
+# and open ONE chat subscription per channel, and learn about channels it is added
+# to afterwards from the relay-signed kind-44100/44101 membership notifications.
+
+
+def _req_filters(transport):
+    """Every filter object across every REQ frame the connector sent."""
+    return [f for frame in transport.sent if frame[0] == "REQ" for f in frame[2:] if isinstance(f, dict)]
+
+
+def _reqs_by_sub(transport):
+    return {frame[1]: [f for f in frame[2:] if isinstance(f, dict)] for frame in transport.sent if frame[0] == "REQ"}
+
+
+def _closed_subs(transport):
+    return [frame[1] for frame in transport.sent if frame[0] == "CLOSE"]
+
+
+def test_chat_subscription_is_opened_per_channel_and_never_globally():
+    """THE BUG: one global `{"kinds":[9]}` filter matched nothing the relay fans out.
+
+    Fails against the pre-fix connector, which sent exactly one un-scoped kind-9
+    filter for the whole connection and no per-channel REQ at all."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL, name="home-network")])))
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL_B, name="general")])))
+
+    by_sub = _reqs_by_sub(transport)
+    assert by_sub[f"buzz-chat-{CHANNEL}"] == [{"kinds": [9], "#h": [CHANNEL]}]
+    assert by_sub[f"buzz-chat-{CHANNEL_B}"] == [{"kinds": [9], "#h": [CHANNEL_B]}]
+    # No global kind-9 filter, and no multi-value `#h` (the relay drops both).
+    for f in _req_filters(transport):
+        if 9 in f.get("kinds", []):
+            assert len(f.get("#h", [])) == 1, f
+
+
+def test_discovery_events_populate_metadata_and_drive_chat_subscriptions():
+    """Discovery does double duty: it is the DM-detection cache AND the channel list."""
+    ch, captured = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL, name="Ops DM", channel_type="dm")])))
+
+    assert ch._channel_meta[CHANNEL] == {"type": "dm", "name": "Ops DM"}
+    assert f"buzz-chat-{CHANNEL}" in _reqs_by_sub(transport)
+    # ... and the cached type still relaxes the mention gate, as before.
+    _dispatch(ch, _event(content="dm without mention", mentions=()))
+    assert len(captured) == 1
+
+
+def test_repeated_metadata_for_a_known_channel_does_not_resubscribe():
+    """kind-39000 is addressable and re-emitted on every channel edit; one REQ is enough."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    for _ in range(4):
+        asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    assert len([frame for frame in transport.sent if frame[0] == "REQ"]) == 1
+
+
+def test_discovery_eose_resubscribes_any_channel_whose_req_failed():
+    """The discovery EOSE is the completeness barrier: by then every discovered
+    channel must have a live chat subscription, including one whose REQ lost a race
+    with a flaky socket."""
+    ch, _ = _started()
+
+    class DropsFirstSend:
+        def __init__(self):
+            self.sent = []
+            self.failed = False
+
+        async def send(self, text):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("relay hiccup")
+            self.sent.append(json.loads(text))
+
+    transport = DropsFirstSend()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    assert _reqs_by_sub(transport) == {}  # the REQ was lost, and must not be remembered as open
+
+    asyncio.run(ch.handle_relay_frame('["EOSE","buzz-discovery"]'))
+    assert f"buzz-chat-{CHANNEL}" in _reqs_by_sub(transport)
+
+
+def test_membership_notification_subscribes_to_a_new_channel_without_a_reconnect():
+    """kind-44100 for OUR pubkey is how the connector learns it was added to a channel
+    mid-connection. It must subscribe immediately -- a channel that only starts
+    working after the next reconnect is the same silent failure in slow motion."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL_B)])))
+
+    by_sub = _reqs_by_sub(transport)
+    assert by_sub[f"buzz-chat-{CHANNEL_B}"] == [{"kinds": [9], "#h": [CHANNEL_B]}]
+    # ... and the discovery subscription is re-issued so the new channel's name/type
+    # (which drives DM detection) is refreshed rather than staying unknown.
+    assert by_sub["buzz-discovery"] == [{"kinds": [39000]}]
+
+
+def test_membership_notification_for_another_member_is_ignored():
+    """The membership subscription is `#p`-filtered, but the filter is the relay's
+    claim; someone else's add must not make us subscribe to their channel."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL_B, target=OUTSIDER)])))
+    assert transport.sent == []
+
+
+def test_member_removed_closes_only_that_channels_subscription():
+    """kind-44101: stop listening to that channel, keep every other subscription on
+    the same socket (this is what `close_frame` exists for)."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL_B, name="general")])))
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_REMOVED, CHANNEL)])))
+
+    assert _closed_subs(transport) == [f"buzz-chat-{CHANNEL}"]
+    assert ch._chat_subscriptions == {CHANNEL_B}
+    assert CHANNEL not in ch._channel_meta  # stale metadata must not survive the removal
+
+    # Being re-added later must work on the same connection.
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL)])))
+    assert ch._chat_subscriptions == {CHANNEL, CHANNEL_B}
+
+
+def test_relay_closing_a_chat_subscription_is_forgotten_so_it_can_be_reopened():
+    """buzz-relay CLOSEs a channel's subscription when access is revoked (e.g. the
+    channel is archived). Remembering it as live would make the later 44100
+    resubscribe a no-op."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])))
+    assert ch._chat_subscriptions == {CHANNEL}
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["CLOSED", f"buzz-chat-{CHANNEL}", "channel access revoked"])))
+    assert ch._chat_subscriptions == set()
+
+    asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-membership", _membership_event(buzz_nostr.KIND_MEMBER_ADDED, CHANNEL)])))
+    assert ch._chat_subscriptions == {CHANNEL}
+
+
+def test_watermark_is_per_channel_so_a_quiet_channel_is_never_skipped():
+    """A single global `since` is the unsafe direction here: it is the newest event
+    processed in ANY channel, so a quiet channel's REQ would ask for events newer
+    than a busy channel's traffic and silently skip everything published in the
+    quiet one while we were disconnected."""
+    ch, captured = _started(mention_free_channels=[CHANNEL, CHANNEL_B])
+    _dispatch(ch, _event(channel=CHANNEL, content="busy", mentions=(), created_at=1700000900))
+    _dispatch(ch, _event(channel=CHANNEL_B, content="quiet", mentions=(), created_at=1700000100))
+    assert len(captured) == 2
+
+    assert ch._chat_filter(CHANNEL)["since"] == 1700000900
+    assert ch._chat_filter(CHANNEL_B)["since"] == 1700000100  # not dragged forward by the busy channel
+
+
+def test_watermark_map_is_bounded_against_remote_feeding():
+    """Channel ids come from remote `h` tags, so the cursor map is remote-fed too.
+    Eviction only ever costs replay (the relay's default backlog), never a skip."""
+    ch, _ = _started()
+    for i in range(MAX_CACHED_CHANNELS + 25):
+        ch._advance_watermark(f"chan-{i}", 1700000000 + i)
+    assert len(ch._seen_created_at) == MAX_CACHED_CHANNELS
+    assert "chan-0" not in ch._seen_created_at
+    assert f"chan-{MAX_CACHED_CHANNELS + 24}" in ch._seen_created_at
+
+
+def test_chat_subscription_count_is_bounded(caplog):
+    """One REQ per channel means the subscription count is driven by remote-fed
+    channel metadata; it must be capped rather than tracking it without limit."""
+    ch, _ = _started()
+    transport = FakeTransport()
+    ch._transport = transport
+    with caplog.at_level(logging.WARNING, logger="app.channels.buzz"):
+        for i in range(MAX_CHANNEL_SUBSCRIPTIONS + 5):
+            asyncio.run(ch.handle_relay_frame(json.dumps(["EVENT", "buzz-discovery", _meta_event(f"chan-{i}")])))
+    assert len(ch._chat_subscriptions) == MAX_CHANNEL_SUBSCRIPTIONS
+    assert "chan-0" in ch._chat_subscriptions  # a working subscription is never evicted for a new one
+    assert "subscription limit" in caplog.text
+
+
+def test_session_reestablishes_auth_discovery_and_per_channel_subscriptions_on_reconnect():
+    """Every subscription is per-connection state: a reconnect must redo NIP-42 auth,
+    re-run discovery, and reopen a chat subscription per channel. Before this fix the
+    reconnect faithfully restored a subscription that received nothing."""
+    ch, _ = _started()
+
+    frames = ['["AUTH","challenge-{n}"]', None, '["EOSE","buzz-discovery"]']
+    sockets = []
+
+    def make_socket(n):
+        ws = ScriptedWS([frames[0].format(n=n), json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)]), frames[2]])
+        sockets.append(ws)
+        return ws
+
+    connects = []
+
+    async def connect():
+        connects.append(1)
+        if len(connects) == 1:
+            return make_socket(1)
+        if len(connects) == 2:
+            return make_socket(2)
+        raise asyncio.CancelledError()
+
+    ch._connect = connect
+
+    async def run():
+        import unittest.mock
+
+        real_sleep = asyncio.sleep
+
+        async def instant_yield(*_a, **_kw):
+            await real_sleep(0)
+
+        with unittest.mock.patch("app.channels.buzz.asyncio.sleep", new=unittest.mock.AsyncMock(side_effect=instant_yield)):
+            task = asyncio.get_running_loop().create_task(ch._run_loop())
+            for _ in range(500):
+                await real_sleep(0)
+                if len(connects) >= 3:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+    assert len(sockets) == 2, "expected the relay loop to reconnect"
+    for ws in sockets:
+        by_sub = _reqs_by_sub(ws)
+        assert [f for f in ws.sent if f[0] == "AUTH"], "expected NIP-42 auth on every connection"
+        assert by_sub["buzz-discovery"] == [{"kinds": [39000]}]
+        assert by_sub["buzz-membership"] == [{"kinds": [44100, 44101], "#p": [PK3_HEX]}]
+        assert by_sub[f"buzz-chat-{CHANNEL}"] == [{"kinds": [9], "#h": [CHANNEL]}]
+
+
+def test_session_end_drops_chat_subscription_bookkeeping():
+    """Subscriptions do not survive their socket; remembering them would make the
+    next connection skip the REQs it must re-send."""
+    ch, _ = _started()
+    ws = ScriptedWS([json.dumps(["EVENT", "buzz-discovery", _meta_event(CHANNEL)])])
+    asyncio.run(ch._session(ws))
+    assert ch._chat_subscriptions == set()
+    assert ch._transport is None
