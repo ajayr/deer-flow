@@ -31,6 +31,7 @@
 |---|---|---|
 | `docker/docker-compose.yaml` | Gateway mounts the **project root as a directory** (`..:/app/deer-flow-runtime:ro`) with `DEER_FLOW_CONFIG_PATH` / `DEER_FLOW_EXTENSIONS_CONFIG_PATH` pointing into it — so `config.yaml` edits hot-reload **without a restart** (avoids single-file bind-mount inode pinning). Kept through the 2026-07-15 merge (`91041ab6`) and auto-merged cleanly in the 2026-07-27 merge (`4394046f` — upstream only touched build args/provisioner env, no volume conflict); the **production** compose upstream still uses single-file mounts, so this row stays. Upstream's `redis` service was adopted alongside it (2026-07-15). | `103f179e` |
 *Upstream PRs in flight from this deployment:*
+- **(pending PR)** (`fork` branch `feat/honcho-memory-backend`) — new `backends/honcho/` memory backend (user-model memory via Honcho, RFC #1898); deployed locally with `manager_class: honcho`. PR number to be added when opened.
 - **#4518** (`fork` branch `docs/crawl4ai-0.9-mandatory-auth`) — `config.example.yaml`'s Crawl4AI block still says JWT auth is optional and pins the RCE-carrying 0.8.6; docs-only, no local file depends on it.
 - **#4519** (`fork` branch `fix/browserless-timeout-key-alias`) — `browserless` accepts `timeout` alongside `timeout_s` (the key-spelling trap below), plus the missing bool/string coercion guards its sibling providers already have. Touches upstream-tracked `community/browserless/tools.py`; we don't run `web_capture`, so nothing here depends on it.
 
