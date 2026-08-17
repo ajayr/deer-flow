@@ -16,7 +16,10 @@ DeerFlow is a LangGraph-based AI super agent system with a full-stack architectu
 - `make dev`, Docker dev, and production all run the agent runtime in Gateway via `RunManager` + `run_agent()` + `StreamBridge` (`packages/harness/deerflow/runtime/`). Nginx exposes that runtime at `/api/langgraph/*` and rewrites it to Gateway's native `/api/*` routers.
 - Gateway streams `write_file` and `str_replace` argument deltas in bounded batches when clients also subscribe to `values`; messages-only consumers retain the original per-chunk contract, while `values` preserves the complete tool call.
 - With `stream_subgraphs`, subgraph frames keep their namespace in the SSE event name (`values|<ns>`, LangGraph Platform style) instead of impersonating root frames — a delegated subagent inherits the parent checkpoint namespace, so publishing its `values` snapshot as bare `values` replaces the whole thread view in SDK clients (#4399). Root-only consumers (file-tool chunk batcher, subagent event persistence, LLM error-fallback detection) ignore namespaced frames. The web frontend does not request subgraph streaming; subtask progress rides root-namespace `task_*` custom events.
+- Background subagent identity is deliberately split: the provider `tool_call_id` remains the correlation key for `ToolMessage`, `task_*` SSE events, persisted lifecycle events, frontend cards, and the public `ExtensionData.scope_id` contract (stored as `SubagentResult.external_task_id`), while `SubagentExecutor.execute_async()` generates a full server-side `execution_id` for `SubagentResult.task_id`, the process-wide registry, polling, cancellation, timeout handling, and cleanup. Provider IDs are not globally unique across parent runs, so they must never become registry ownership keys; scheduler closures retain their own `SubagentResult` rather than resolving ownership again through the mutable registry. Terminal subagent token usage travels in the current run's `ToolMessage.additional_kwargs` and is attributed from message state, never through a process-global provider-ID cache.
 - Scheduled-task executions must reuse that same Gateway run lifecycle. The scheduler may decide *when* work runs, but it must dispatch through the existing run path rather than introducing a parallel execution stack.
+- The background scheduler is single-instance by default. `scheduler.multi_instance=true` opts into lease-aware recovery across Gateway instances and requires shared Postgres, `run_ownership.heartbeat_enabled=true`, and `run_events.backend=db`; otherwise startup rejects the configuration. Live scheduled runs are preserved when a peer starts; expired leases are atomically taken over, stale post-launch writes are fenced by the dispatch lease owner, and the Postgres advisory-locked budget makes `max_concurrent_runs` a shared global cap (including pre-launch reservations).
+- Long-running MCP work uses a separate durable task runtime rather than keeping remote task IDs or status polling inside the Agent loop. Explicit `task_toolsets` bind raw submit/status/cancel names; only submit remains Agent-visible, and its wrapper persists the remote handle before returning a local ID. `McpTaskService` claims due rows with leases, resolves a protocol-specific `McpTaskDriver`, and writes normalized snapshots back to `mcp_tasks`; expired leases are the restart-recovery mechanism, and a result returned after expiry must be discarded even when the owner token still matches. The database is the source of truth. `ThreadState` may receive only a bounded projection in later integration work, never the sole recoverable copy.
 - Scheduled-task dispatch enforces "at most one active run per task when `overlap_policy=skip`" at the DB layer via the partial unique index `uq_scheduled_task_run_active` (`scheduled_task_runs.task_id WHERE status IN ('queued','running')`). `ScheduledTaskService.dispatch_task`'s `has_active_runs` check is a non-atomic fast path (its own session, separated from the `create()` insert by `await` points), so two concurrent dispatches — a manual `POST /scheduled-tasks/{id}/trigger` racing the poller, a double-click, or a client retry — can both pass it; the index is the atomic arbiter, and the losing `create` surfaces as `ActiveScheduledRunConflict` (translated from `IntegrityError` in the repository) and collapses to the same outcome as the fast path (manual → 409 conflict, scheduled → a `"skipped"` tombstone). The scheduled-skip tombstone is created directly as terminal `"skipped"` (not a transient `"queued"`) so it never occupies the active slot the pre-existing run still holds. Sibling of the `runs` table's `uq_runs_thread_active` (PR #4003), which keys on `thread_id` and so does not cover the default `fresh_thread_per_run` context where every dispatch gets a new thread. Index is status-only, not `overlap_policy`-conditional (the policy is fixed to `"skip"` in the MVP).
 
 **Project Structure**:
@@ -88,6 +91,11 @@ When making code changes, you MUST update the relevant documentation:
 ```bash
 make check      # Check system requirements
 make install    # Install all dependencies (frontend + backend)
+make extension-install SOURCE=...  # Install and enable a trusted Python extension
+make extension-list                # List configured Python extensions
+make extension-enable NAME=...     # Enable an installed extension
+make extension-disable NAME=...    # Disable an extension without uninstalling it
+make extension-remove NAME=...     # Remove a managed extension
 make detect-thread-boundaries  # Inventory backend executor/thread/event-loop boundaries
 make dev        # Start all services (Gateway + Frontend + Nginx), with config.yaml preflight
 make start      # Start production services locally
@@ -97,7 +105,7 @@ make stop       # Stop all services
 **Backend directory** (for backend development only):
 ```bash
 make install            # Install backend dependencies
-make dev                # Run Gateway API with reload (port 8001)
+make dev                # Run Gateway API with runtime-safe reload (port 8001)
 make gateway            # Run Gateway API only (port 8001)
 make test               # Run offline backend tests (excludes live external-API tests)
 make test-live          # Explicitly run live DeerFlowClient tests with real APIs
@@ -107,218 +115,13 @@ make format             # Format code with ruff
 make migrate-rev MSG="..."  # Autogenerate a new alembic revision (see Schema Migrations section)
 ```
 
-The root `detect-thread-boundaries` target statically inventories execution
-boundaries under `backend/app/` and `backend/packages/harness/deerflow/`. It
-prints a concise count by execution domain and writes the complete, versioned
-JSON payload to `.deer-flow/thread-boundary-inventory.json`. Every finding has
-a stable `boundary_kind`: `asyncio_default_executor`, `dedicated_executor`,
-`anyio_worker_thread`, `direct_event_loop_blocking`, `separate_event_loop`, or
-`unresolved_dynamic_boundary`.
+The backend `make dev` target pre-creates and excludes `DEER_FLOW_HOME`
+(default: `backend/.deer-flow`) and `backend/sandbox` from Uvicorn's reload
+watcher. Do not replace it with a bare `uvicorn --reload`: agent tasks write
+Python and other runtime files below `DEER_FLOW_HOME`, which would otherwise
+restart the Gateway during an active run.
 
-The AST inventory covers `asyncio.to_thread`, default and explicit
-`run_in_executor` submissions, imported aliases, simple same-module helper
-wrappers (after pre-registering dedicated executor targets), `set_default_executor`,
-`ThreadPoolExecutor` construction/submission,
-additional event loops, synchronous LangChain tools, and direct
-`BaseChatModel` fallback inheritance. It remains read-only and does not alter
-executor routing or sizing.
-
-To supplement the static scan with configured runtime types, run:
-
-```bash
-python scripts/detect_thread_boundaries.py \
-  --runtime-config config.yaml \
-  --json-output .deer-flow/thread-boundary-inventory.json
-```
-
-Runtime inspection imports configured tool objects and model classes so it can
-record concrete tool names/types/modules, sync functions, async coroutines,
-and `_agenerate`/`_astream` ownership. It does not invoke tools, instantiate
-models, or call external services; import failures remain in the JSON as
-`unresolved_dynamic_boundary` records. The detector implementation and focused
-coverage live in `tests/support/detectors/thread_boundaries.py` and
-`tests/test_detect_thread_boundaries.py`.
-
-The `detect-blocking-io` target parses `app/`, `packages/harness/deerflow/`,
-and `scripts/` with AST. By default it reports only blocking IO candidates that
-are inside async code, reachable from async code in the same file, or reachable
-from sync-only `AgentMiddleware` before/after hooks that LangGraph can execute
-on the async graph path. It prints a concise summary and writes complete JSON
-findings to `.deer-flow/blocking-io-findings.json` at the repository root
-(both `make detect-blocking-io` from the repo root and `cd backend && make
-detect-blocking-io` resolve to the same repo-root path). JSON findings include
-`priority`, `location`, `blocking_call`, `event_loop_exposure`, `reason`, and
-`code` for model-assisted or manual review. `priority` is a deterministic
-review ordering from operation type, not proof of a bug. Bare-name same-file
-calls are resolved by function name, so duplicate helper names in one file can
-conservatively over-report async reachability. The call graph also resolves
-multi-hop `self.`/`cls.` attribute chains (`self.store.flush()`) and local
-variables or parameters traced back — within the same function only — to a
-`self.`/`cls.` attribute (`store = self.store; store.flush()`); both fall back
-to the same bare-method-name resolution as an unresolvable receiver, so they
-share its over-report risk rather than adding a new kind. Deeper cross-function
-or cross-module aliasing is out of scope and stays an unreported false
-negative.
-
-That same-function alias tracing is deliberately narrower than the symbolic
-names `dotted_name()` builds for blocking-call pattern matching elsewhere in
-this module: receiver/alias extraction uses a restricted extractor that only
-recognizes `Name`/`Attribute` chains, so a `Call` or `Subscript` result (e.g.
-`factory().flush()`, or `client = factory(); client.flush()` /
-`client = clients[0]; client.flush()`) is never treated as inheriting its
-base's alias-worthiness — including when the unsupported node is buried
-deeper in the chain (`factory().client.flush()`, `clients[0].client.flush()`):
-an unrecognized shape anywhere in the chain makes the whole receiver
-unresolved, it never falls back to just the chain's trailing attribute name,
-or that name alone could still collide with an unrelated traced parameter or
-local alias. Reassigning a traced name to a non-traceable value (anything
-other than a `self.`/`cls.` attribute or an already-traced name) kills its
-alias instead of leaving it traceable, so a stale alias from an earlier
-assignment cannot keep exposing an unrelated same-named method after the
-variable is reassigned to something else; the assignment's right-hand side is
-always analyzed against the alias state as it stood *before* this kill-or-add
-update, matching Python's own evaluate-then-bind order, so
-`client = client.flush()` still resolves that call against `client`'s prior
-(pre-reassignment) alias instead of the state after it's gone. `if`/`else`
-branches get isolated alias state — an alias added in one branch cannot leak
-into the other — and the state after the whole `if` is the union of what each
-branch produced (a conservative may-alias join), so the result no longer
-depends on which branch is textually `body` vs. `orelse`. This branch
-isolation is deliberately scoped to `ast.If` only; `ast.Try`/`ast.Match` have
-different, more complex control-flow semantics and keep the older unisolated
-traversal. Finally, a function's decorators and parameter defaults are
-analyzed in the *enclosing* scope rather than the new function's own, and
-parameter/return annotations get the same enclosing-scope treatment unless
-the module postpones annotation evaluation (`from __future__ import
-annotations`), in which case they are skipped entirely, in either scope —
-those expressions run at definition time, before the function has ever been
-called (or, when postponed, never run at all), so a call there is never
-attributed to the function being defined (it moves to whatever scope actually
-contains the `def`, e.g. the enclosing function, or disappears if that scope
-is module/class level and therefore never async-reachable). PEP 695
-type-parameter bounds are not visited in either scope: CPython evaluates each
-one lazily, in its own hidden function, only if something like `T.__bound__`
-is actually accessed, never as part of running the `def` statement itself.
-A `lambda`'s body and a bare generator expression's element/filters/later
-`for` clauses are excluded from traversal ONLY while walking another
-function's own definition-time expressions (decorators, parameter defaults/
-annotations, return annotation): there, we know structurally that the
-enclosing `def` statement is executing right now, and neither a lambda body
-nor a generator's element runs just because the lambda/generator object is
-created — only a lambda's own parameter defaults and a generator's
-outermost iterable are genuinely eager at that moment. This exclusion is
-absolute and has no exceptions: even a lambda that is immediately invoked at
-its own definition site (`(lambda: ...)()`), or a generator passed directly
-to an eager-consuming builtin, is still excluded when it appears inside
-another function's decorator/default/annotation — a narrow, intentional
-limitation given how rarely a definition-time expression contains an
-executed call at all, preferred over special-casing specific shapes there.
-
-Everywhere else — module level, class bodies, and ordinary function-body
-statements — a lambda body or generator expression's element is scanned
-unconditionally, the same conservative, over-report-rather-than-infer stance
-this file already takes for reachability elsewhere (the `ast.If` may-alias
-union, the bare-name call-graph resolution). This file does not attempt to
-distinguish a lambda that is invoked immediately, invoked later through a
-stored variable, passed as a callback, or never called at all, nor a
-generator that is consumed by an eager builtin (`list`, `sum`, `any`, etc.),
-wrapped in another lazy iterator (`map`, `filter`), or never consumed —
-telling these apart in the general case would mean inferring evaluation
-order and consumption across arbitrary code rather than reading a fixed,
-structural fact, so none of them are special-cased; all are scanned the
-same way. This is intentionally informational and is not run from CI in
-this round.
-
-For a diff-scoped view of the same findings, `scripts/scan_changed_blocking_io.py`
-(repo root) reports findings on the added lines of `git diff <base>...HEAD`
-plus findings new versus the merge base (so a new async caller exposing an
-untouched sync helper in the same file is still reported) — used by the
-`blocking-io-guard` skill (`.agent/skills/blocking-io-guard/`) as the
-deterministic scope step before routing each candidate to a fix and/or a
-`tests/blocking_io/` runtime anchor.
-
-Regression tests related to Docker/provisioner behavior:
-- `tests/test_docker_sandbox_mode_detection.py` (mode detection from `config.yaml`)
-- `tests/test_provisioner_kubeconfig.py` (kubeconfig file/directory handling)
-- `tests/test_provisioner_request_threading.py` (keeps provisioner sandbox CRUD
-  endpoints as sync FastAPI handlers so synchronous K8s client calls run in the
-  Starlette worker pool instead of on the ASGI event loop)
-
-Blocking-IO runtime gate (`tests/blocking_io/`):
-- Wraps every item under `tests/blocking_io/` with a strict Blockbuster
-  context scoped to `app.*` and `deerflow.*` (see
-  `tests/support/detectors/blocking_io_runtime.py`). Any sync blocking IO
-  call whose stack passes through DeerFlow business code while running on
-  the asyncio event loop raises `BlockingError` and fails the test.
-- Regression anchors live there: `test_skills_load.py` (locks the
-  `asyncio.to_thread` offload around `LocalSkillStorage.load_skills`, fix
-  for #1917); `test_sqlite_lifespan.py` (locks the offload around
-  SQLite path resolution plus `ensure_sqlite_parent_dir`, fix for #1912);
-  `test_jsonl_run_event_store.py` (locks `JsonlRunEventStore`'s async
-  API — including idempotent singleton-event writes — offloading its file IO
-  via `asyncio.to_thread`); `test_run_journal_callbacks.py` (locks
-  `RunJournal.run_inline` tool callbacks to in-memory/event-loop-safe work);
-  `test_integrations_router.py` (locks Lark integration install and auth
-  completion route handlers offloading archive filesystem work and `lark-cli`
-  subprocesses);
-  `test_uploads_middleware.py` (locks `UploadsMiddleware.abefore_agent`
-  offloading the uploads-directory scan off the event loop);
-  `test_uploads_router.py` (locks Gateway upload/list/delete endpoints
-  offloading upload directory creation, staged writes, chmod/cleanup,
-  directory scans/deletes, and remote sandbox sync off the event loop);
-  `test_feishu_receive_file.py` (locks Feishu attachment path preparation and
-  persistence plus remote sandbox acquisition/sync off the event loop, and
-  skips redundant sandbox sync when thread data is already mounted);
-  `test_channel_outbound_files.py` (locks Feishu, Telegram, and WeCom outbound
-  attachment open/read/hash work off the event loop);
-  `test_openviking_memory_backend.py` (locks the official OpenViking backend's
-  async add/context/search entrypoints offloading synchronous SDK and cursor
-  filesystem IO); and
-  `test_workspace_changes_recorder.py` (locks the offload around the snapshot
-  text cache lifecycle — roots resolution, `mkdtemp`, and the `shutil.rmtree`
-  on both the capture-failure branch and `record_workspace_changes`' `finally`).
-- `test_gate_smoke.py` is a meta-test asserting the gate actually catches
-  unoffloaded blocking IO and that the `@pytest.mark.allow_blocking_io`
-  opt-out works.
-- Coverage boundary: the gate only sees code that test execution actually
-  touches. Static AST coverage is a separate concern (out of scope for
-  this PR).
-- CI: runs on every PR via `.github/workflows/backend-blocking-io-tests.yml`,
-  hard-fail.
-
-Boundary check (harness → app import firewall):
-- `tests/test_harness_boundary.py` — ensures `packages/harness/deerflow/` never imports from `app.*`
-
-Memory backend async boundary:
-- `MemoryMiddleware.aafter_agent` calls `MemoryManager.aadd`; network-backed
-  managers must override their `a*` methods to offload or use native async I/O.
-- The mem0 backend requires an HTTPS `base_url` by default because requests
-  carry an API token. Plain HTTP requires the explicit
-  `backend_config.allow_insecure_http: true` local-development opt-in.
-- Gateway memory routes offload the synchronous management contract with
-  `asyncio.to_thread`, so backend file or HTTP I/O does not run on the ASGI
-  event loop. Gateway startup and shutdown also resolve the manager off-loop,
-  because a backend's `from_config` may perform a fail-fast connectivity check.
-- A backend may set `requires_passive_writes_in_tool_mode = True` when tool-mode
-  search is supported but durable writes still depend on conversation-level
-  extraction. Such backends receive memory tools and retain `MemoryMiddleware`.
-- Prompt recall rethrows `MemoryManagerError` only when backend config declares
-  `failure_policy.read: fail_closed`; other recall errors preserve the existing
-  log-and-empty-context behavior.
-
-CI runs these regression tests for every pull request via [.github/workflows/backend-unit-tests.yml](../.github/workflows/backend-unit-tests.yml).
-
-Agentic browser sessions are process-local. The Gateway startup safety gate rejects
-`GATEWAY_WORKERS > 1` when `browser_navigate` is configured, because ordinary
-uvicorn worker dispatch does not provide thread affinity for browser tools, REST
-navigation, and the Live WebSocket.
-
-Browser Live screenshots remain JPEG bytes inside the harness and the Gateway's
-bounded, drop-oldest frame queue. WebSocket clients that request
-`frame_format=binary` receive binary messages; control metadata remains JSON.
-The legacy no-parameter protocol still base64-encodes frames into JSON at the
-Gateway boundary for backward compatibility. Unknown `frame_format` values
-receive a JSON error and close code 1008.
+More specific `AGENTS.md` files in backend code directories contain the subsystem sections split from this file. Follow the nearest file in the directory tree.
 
 ## Architecture
 
@@ -349,10 +152,14 @@ from deerflow.config import get_app_config
 ```
 
 Package import hygiene: the `deerflow.agents` and `deerflow.subagents` package
-roots expose heavyweight graph/executor entrypoints lazily. Internal modules
-that only need lightweight types, config, or registries should import the
-concrete submodule instead of adding eager package-root imports that pull in the
-tool graph or subagent executor during state/schema imports.
+roots expose heavyweight graph/executor entrypoints lazily. The
+`deerflow.agents:make_lead_agent` LangGraph Server entrypoint is a concrete thin
+module-level function because the server resolves graph factories directly from
+the module dictionary; the wrapper keeps the lead-agent and skill-cache imports
+inside the function so importing the package remains lightweight. Internal
+modules that only need lightweight types, config, or registries should import
+the concrete submodule instead of adding eager package-root imports that pull in
+the tool graph or subagent executor during state/schema imports.
 
 ### Agent System
 
