@@ -154,16 +154,33 @@ class CodexChatModel(BaseChatModel):
                 if msg.content:
                     content = self._normalize_content(msg.content)
                     input_items.append({"role": "assistant", "content": content})
-                if msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        input_items.append(
-                            {
-                                "type": "function_call",
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["args"]) if isinstance(tc["args"], dict) else tc["args"],
-                                "call_id": tc["id"],
-                            }
-                        )
+                # Malformed calls are parked on ``invalid_tool_calls``, but
+                # DanglingToolCallMiddleware answers them with a placeholder ToolMessage;
+                # Responses rejects that function_call_output unless its function_call
+                # item is in the request too.
+                #
+                # A function_call item needs both a name and a call_id, and every
+                # InvalidToolCall field is nullable, so a call missing either is dropped
+                # rather than serialized as a schema-invalid item. Dropping one cannot
+                # orphan a placeholder ToolMessage: the middleware mints a synthetic id
+                # and a fallback name for exactly these calls before serialization, so a
+                # call still missing them here has no placeholder to pair with.
+                for tc in [*msg.tool_calls, *(msg.invalid_tool_calls or [])]:
+                    name = tc.get("name")
+                    call_id = tc.get("id")
+                    if not (isinstance(name, str) and name):
+                        continue
+                    if not (isinstance(call_id, str) and call_id):
+                        continue
+                    args = tc.get("args")
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "name": name,
+                            "arguments": json.dumps(args) if isinstance(args, dict) else (args or "{}"),
+                            "call_id": call_id,
+                        }
+                    )
             elif isinstance(msg, ToolMessage):
                 input_items.append(
                     {
@@ -266,6 +283,27 @@ class CodexChatModel(BaseChatModel):
                             streamed_output_items[output_index] = output_item
                     elif event_type == "response.completed":
                         completed_response = data["response"]
+                        # A terminal event completes the request even if the server
+                        # keeps the connection open. Do not let a later read timeout
+                        # replace the completed output with a transport error.
+                        break
+                    elif event_type in ("response.failed", "response.incomplete", "error"):
+                        response = data.get("response") or {}
+                        if event_type == "error":
+                            details = data.get("error") or data
+                        elif not isinstance(response, dict):
+                            details = response
+                        elif event_type == "response.failed":
+                            details = response.get("error") or {}
+                        else:
+                            details = response.get("incomplete_details") or {}
+
+                        if not isinstance(details, dict):
+                            details = {"message": str(details)}
+                        code = details.get("code")
+                        reason = details.get("message") or details.get("reason") or "No details provided"
+                        code_suffix = f" ({code})" if code else ""
+                        raise RuntimeError(f"Codex API {event_type}{code_suffix}: {reason}")
 
         if not completed_response:
             raise RuntimeError("Codex API stream ended without response.completed event")

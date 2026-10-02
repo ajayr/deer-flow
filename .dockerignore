@@ -1,4 +1,4 @@
-.env
+**/.env
 Dockerfile
 .dockerignore
 .git
@@ -65,17 +65,18 @@ frontend/node_modules
 backend/.venv
 backend/htmlcov
 backend/.coverage
+
+# Runtime state written by a running DeerFlow (DEER_FLOW_HOME, bind-mounted at
+# runtime) must never enter the build context: it holds the auth/JWT secret,
+# per-user integration credentials, threads, memory and the sqlite database, and
+# root-owned paths that break `docker build` for non-root users — backend/Dockerfile
+# does `COPY backend ./backend`, so leaving these in bakes them into the image.
+**/.deer-flow/
+backend/sandbox/
 *.md
 !README.md
 !frontend/README.md
 !backend/README.md
-
-# Runtime state, bind-mounted at runtime (DEER_FLOW_HOME) — must never enter the
-# build context: it holds the auth/JWT secret, per-user integration credentials,
-# threads and memory, and root-owned paths that break `docker build` for non-root
-# users.
-backend/.deer-flow/
-.deer-flow/
 
 # Extension manager snapshots must enter the backend builder intact. A Python
 # package may require README metadata, native modules, or package assets that

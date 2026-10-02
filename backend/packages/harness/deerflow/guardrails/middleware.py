@@ -12,6 +12,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
+from deerflow.authz.outcome import AuthorizationOutcome, put_authorization_outcome
 from deerflow.authz.principal import normalize_authz_attributes
 from deerflow.guardrails.provider import GuardrailDecision, GuardrailProvider, GuardrailReason, GuardrailRequest
 from deerflow.runtime.events.catalog import MIDDLEWARE_GUARDRAIL_TAG
@@ -35,6 +36,37 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
         self.fail_closed = fail_closed
         self.passport = passport
 
+    def _resolve_policy_identity(self) -> tuple[str, str]:
+        """Return ``(policy_id, policy_version)`` without the provider's full declaration.
+
+        Deliberately does not call ``self.provider.release_policy_parameters()``:
+        that also computes ``provider_parameters`` (e.g. sorting allow/deny
+        lists), which is wasted work on the per-tool-call authorization-outcome
+        path that only ever wants these two identity strings.
+        """
+        policy_id = getattr(self.provider, "policy_id", None)
+        if not isinstance(policy_id, str) or not policy_id:
+            policy_id = str(getattr(self.provider, "name", type(self.provider).__name__))
+        policy_version = getattr(self.provider, "policy_version", None)
+        if not isinstance(policy_version, str) or not policy_version:
+            policy_version = str(getattr(self.provider, "version", "unknown"))
+        return policy_id, policy_version
+
+    def release_policy_parameters(self) -> dict[str, object]:
+        provider_parameters: dict[str, object] = {}
+        release_parameters = getattr(self.provider, "release_policy_parameters", None)
+        if callable(release_parameters):
+            declared = release_parameters()
+            if isinstance(declared, dict):
+                provider_parameters = declared
+        policy_id, policy_version = self._resolve_policy_identity()
+        return {
+            "fail_closed": self.fail_closed,
+            "passport": self.passport,
+            "policy": {"id": policy_id, "version": policy_version},
+            "provider_parameters": provider_parameters,
+        }
+
     @staticmethod
     def _resolve_context(request: ToolCallRequest) -> dict:
         runtime = getattr(request, "runtime", None)
@@ -42,6 +74,17 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
         return context if isinstance(context, dict) else {}
 
     def _build_request(self, request: ToolCallRequest, context: dict) -> GuardrailRequest:
+        # The concrete bound tool object (or None for an unregistered/dynamic
+        # name): provenance is forwarded as provider context, and the object
+        # identity backs the authorization adapter's infrastructure exemption
+        # so a same-named foreign tool can never inherit it.
+        # Local import: a module-level import of deerflow.tools.tool_provenance
+        # pulls in the deerflow.tools package __init__ (builtins → task_tool →
+        # subagents), which is circular while the subagent executor is itself
+        # being imported. At tool-call time the chain is fully initialized.
+        from deerflow.tools.tool_provenance import tool_provenance_context
+
+        tool = getattr(request, "tool", None)
         return GuardrailRequest(
             tool_name=str(request.tool_call.get("name", "")),
             tool_input=request.tool_call.get("args", {}),
@@ -58,6 +101,8 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
             channel_user_id=context.get("channel_user_id"),
             is_internal=context.get("is_internal") is True,
             authz_attributes=normalize_authz_attributes(context.get("authz_attributes")),
+            tool_provenance=tool_provenance_context(tool),
+            tool_identity=tool,
         )
 
     def _build_denied_message(self, request: ToolCallRequest, decision: GuardrailDecision) -> ToolMessage:
@@ -70,6 +115,17 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
             tool_call_id=tool_call_id,
             name=tool_name,
             status="error",
+        )
+
+    def _build_authorization_outcome(self, decision: GuardrailDecision) -> AuthorizationOutcome:
+        resolved_policy_id, policy_version = self._resolve_policy_identity()
+        policy_id = decision.policy_id or resolved_policy_id
+        reason_codes = tuple(reason.code for reason in decision.reasons if reason.code)
+        return AuthorizationOutcome(
+            decision="allowed" if decision.allow else "denied",
+            policy_id=policy_id,
+            policy_version=policy_version,
+            reason_codes=reason_codes,
         )
 
     def _record_guardrail_event(
@@ -146,6 +202,7 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="deny_tool_call",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return self._build_denied_message(request, decision)
             else:
                 decision = GuardrailDecision(allow=True, reasons=[GuardrailReason(code="oap.evaluator_error", message="guardrail provider error (fail-open)")])
@@ -156,7 +213,9 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="allow_tool_call_after_provider_error",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return handler(request)
+        put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
         if not decision.allow:
             logger.warning("Guardrail denied: tool=%s policy=%s code=%s", gr.tool_name, decision.policy_id, decision.reasons[0].code if decision.reasons else "unknown")
             self._record_guardrail_event(
@@ -193,6 +252,7 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="deny_tool_call",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return self._build_denied_message(request, decision)
             else:
                 decision = GuardrailDecision(allow=True, reasons=[GuardrailReason(code="oap.evaluator_error", message="guardrail provider error (fail-open)")])
@@ -203,7 +263,9 @@ class GuardrailMiddleware(AgentMiddleware[AgentState]):
                     action="allow_tool_call_after_provider_error",
                     provider_error=True,
                 )
+                put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
                 return await handler(request)
+        put_authorization_outcome(context, request.tool_call.get("id"), self._build_authorization_outcome(decision))
         if not decision.allow:
             logger.warning("Guardrail denied: tool=%s policy=%s code=%s", gr.tool_name, decision.policy_id, decision.reasons[0].code if decision.reasons else "unknown")
             self._record_guardrail_event(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import bisect
 from datetime import UTC, datetime
 
+from deerflow.runtime.events.message_identity import message_identity
 from deerflow.runtime.events.store.base import RunEventStore
 from deerflow.runtime.user_context import AUTO, _AutoSentinel
 
@@ -127,19 +128,31 @@ class MemoryRunEventStore(RunEventStore):
         # contiguous slice located with bisect (O(log m)) rather than a full scan.
         messages = self._messages.get(thread_id, [])
 
-        if before_seq is not None:
+        if after_seq is not None:
+            # Page forward within both exclusive bounds, without copying the
+            # whole window before applying the limit.
+            lo = bisect.bisect_right(messages, after_seq, key=lambda e: e["seq"])
+            hi = len(messages) if before_seq is None else bisect.bisect_left(messages, before_seq, key=lambda e: e["seq"])
+            return messages[lo : min(hi, lo + limit)]
+        elif before_seq is not None:
             # Records with seq < before_seq, then the last `limit` of them.
             hi = bisect.bisect_left(messages, before_seq, key=lambda e: e["seq"])
             return messages[max(0, hi - limit) : hi]
-        elif after_seq is not None:
-            # Records with seq > after_seq, then the first `limit` of them.
-            lo = bisect.bisect_right(messages, after_seq, key=lambda e: e["seq"])
-            return messages[lo : lo + limit]
         else:
             # Return the latest `limit` records, ascending.
             return messages[-limit:]
 
-    async def list_events(self, thread_id, run_id, *, event_types=None, task_id=None, limit=500, after_seq=None):
+    async def list_events(
+        self,
+        thread_id,
+        run_id,
+        *,
+        event_types=None,
+        task_id=None,
+        limit=500,
+        after_seq=None,
+        user_id: str | None | _AutoSentinel = AUTO,
+    ):
         # ``_events_by_run`` is already scoped to this run and seq-ordered, so we
         # touch only this run's events instead of scanning the whole thread.
         run_events = self._events_by_run.get(thread_id, {}).get(run_id, [])
@@ -180,7 +193,33 @@ class MemoryRunEventStore(RunEventStore):
     async def count_messages(self, thread_id):
         return len(self._messages.get(thread_id, []))
 
-    async def delete_by_thread(self, thread_id):
+    async def get_message_seqs(self, thread_id, identities, *, user_id: str | None | _AutoSentinel = AUTO):
+        wanted = set(identities)
+        if not wanted:
+            return {}
+        found: dict[str, int] = {}
+        for record in self._messages.get(thread_id, []):
+            content = record.get("content")
+            if not isinstance(content, dict):
+                continue
+            identity = message_identity(content)
+            # Earliest seq wins: a message replaced later in the same thread
+            # keeps the position it first occupied in the feed.
+            if identity in wanted and identity not in found:
+                found[identity] = record["seq"]
+                # Later rows can only be re-persisted copies that already lose
+                # that tiebreak, so the scan ends with the last wanted seq.
+                if len(found) == len(wanted):
+                    break
+        return found
+
+    async def delete_by_thread(self, thread_id, *, user_id: str | None | _AutoSentinel = AUTO):
+        """Delete every event of a thread.
+
+        Events live in process memory without an owner column, so ``user_id`` is
+        accepted for interface parity with the user-scoped backends and ignored
+        — the same convention as this store's read methods.
+        """
         events = self._events.pop(thread_id, [])
         self._messages.pop(thread_id, None)
         self._events_by_run.pop(thread_id, None)
@@ -188,7 +227,8 @@ class MemoryRunEventStore(RunEventStore):
         self._seq_counters.pop(thread_id, None)
         return len(events)
 
-    async def delete_by_run(self, thread_id, run_id):
+    async def delete_by_run(self, thread_id, run_id, *, user_id: str | None | _AutoSentinel = AUTO):
+        """Delete one run's events; ``user_id`` is accepted for parity only."""
         all_events = self._events.get(thread_id, [])
         if not all_events:
             return 0
