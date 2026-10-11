@@ -61,9 +61,10 @@ def _text_of(content: Any, param: str) -> str:
         if not isinstance(part, Mapping):
             raise invalid_message("Each content part must be an object.", param=part_param)
         kind = part.get("type")
+        if not isinstance(kind, str):
+            raise invalid_message("Each content part needs a string 'type'; only 'text' is supported.", param=f"{part_param}.type")
         if kind != "text":
-            reason = _NOT_YET.get(kind) if isinstance(kind, str) else None
-            raise invalid_message(reason or f"Content part type {quote(kind)} is not supported; only text is.", param=f"{part_param}.type")
+            raise invalid_message(_NOT_YET.get(kind) or f"Content part type {quote(kind)} is not supported; only text is.", param=f"{part_param}.type")
         text = part.get("text")
         if not isinstance(text, str):
             raise invalid_message("A text part needs a string 'text'.", param=f"{part_param}.text")

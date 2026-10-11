@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import tracemalloc
+
 import pytest
 
 from app.gateway.openai_compat.errors import OpenAIError
@@ -157,6 +159,20 @@ def test_a_part_type_that_is_not_a_string_is_refused_not_crashed_on(kind):
     error = _refusal([_user([{"type": kind, "text": "hi"}])])
 
     assert (error.code, error.param) == ("invalid_message", "messages[0].content[0].type")
+    assert error.message == "Each content part needs a string 'type'; only 'text' is supported."
+
+
+def test_a_part_type_that_is_not_a_string_is_not_quoted_back():
+    kind = [0] * 1_000_000
+    tracemalloc.start()
+    try:
+        error = _refusal([_user([{"type": kind, "text": "hi"}])])
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert error.param == "messages[0].content[0].type"
+    assert peak < 1_000_000
 
 
 def test_a_part_must_be_an_object_with_text():
