@@ -36,7 +36,9 @@ def _fit(message: str) -> str:
 
 def quote(value: object) -> str:
     """A client-supplied value, shortened and printable, for use inside a message."""
-    text = "".join(char if char.isprintable() else " " for char in str(value))
+    # Cleaning maps one character to one, so only the head can reach the message.
+    head = str(value)[: MAX_QUOTED_CHARS + 1]
+    text = "".join(char if char.isprintable() else " " for char in head)
     if len(text) > MAX_QUOTED_CHARS:
         text = text[: MAX_QUOTED_CHARS - 3] + "..."
     return f"'{text}'"
