@@ -101,6 +101,8 @@ class Reply:
     rewritten: str | None = None
     #: Subagent tasks that start and finish while the run works.
     subagents: tuple[str, ...] = ()
+    #: The reply is the error message that DeerFlow's model-call middleware returns when the provider fails, and it carries `deerflow_error_fallback`.
+    fallback: bool = False
 
 
 class _ScriptedModel(BaseChatModel):
@@ -114,6 +116,8 @@ class _ScriptedModel(BaseChatModel):
 
     def _message(self, text: str, usage: dict[str, int] | None, *, chunk: bool, first: bool = False) -> Any:
         extra = {"reasoning_content": self.reply.reasoning} if first and self.reply.reasoning else {}
+        if self.reply.fallback:
+            extra["deerflow_error_fallback"] = True
         factory = AIMessageChunk if chunk else AIMessage
         return factory(content=text, additional_kwargs=extra, usage_metadata=usage)
 
@@ -150,6 +154,8 @@ class Script:
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     #: What the rewriting node of the current run puts in place of the stored answer, if anything.
     rewritten: str | None = None
+    #: When set, the run stays open after its answer until the test sets this event.
+    finishing: asyncio.Event | None = None
 
     def say(self, *replies: Any) -> None:
         self.replies.extend(replies)
@@ -184,6 +190,8 @@ def _agent_factory(script: Script):
         return {"messages": [await _ScriptedModel(reply=reply).ainvoke(state["messages"], config)]}
 
     async def rewrite(state: _State):
+        if script.finishing is not None:
+            await script.finishing.wait()
         if script.rewritten is None:
             return {"messages": []}
         return {"messages": [AIMessage(content=script.rewritten, id=state["messages"][-1].id)]}
@@ -1195,6 +1203,36 @@ async def test_a_client_that_hangs_up_leaves_the_run_going_when_the_operator_cho
 
         await until(finished)
         assert not gateway.script.cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_client_that_hangs_up_while_a_failed_run_ends_does_not_stop_it(gateway, monkeypatch, caplog):
+    holding = asyncio.Event()
+
+    class HoldingRunStream(RunStream):
+        async def _wait_for_end(self) -> None:
+            holding.set()
+            await super()._wait_for_end()
+
+    monkeypatch.setattr(openai_router, "RunStream", HoldingRunStream)
+    gateway.script.finishing = asyncio.Event()
+    gateway.script.say(Reply("The model provider failed.", fallback=True))
+
+    async def waiting() -> bool:
+        return holding.is_set()
+
+    with caplog.at_level(logging.INFO, logger=openai_router.logger.name):
+        await chat_and_hang_up(gateway, [user(FIRST)], stream=True, when=waiting)
+        gateway.script.finishing.set()
+
+        async def over() -> bool:
+            return (await only_run(gateway)).status not in (RunStatus.pending, RunStatus.running)
+
+        await until(over)
+
+    # The run had already failed when its client left, so it keeps its error instead of being stopped.
+    assert (await only_run(gateway)).status is RunStatus.error
+    assert any("outcome=failed: run_error" in record.getMessage() for record in caplog.records)
 
 
 class _Manager:
