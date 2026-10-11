@@ -190,3 +190,33 @@ def seed_title(first_user_text: str, *, max_chars: int) -> str:
     if len(text) <= limit:
         return text
     return text[: min(limit, max_chars - len(_ELLIPSIS))].rstrip() + _ELLIPSIS
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadPlan:
+    """Where the newest message of a request runs."""
+
+    #: The stored thread the history continues, or ``None`` when the message starts a new thread.
+    thread_id: str | None
+    #: The newest user message exactly as the client sent it: the input of the run.
+    message: str
+    #: What a new thread is seeded with: every exchange before the newest message. Empty when continuing, because that thread already holds them.
+    seed: tuple[Exchange, ...]
+
+
+def plan_thread(history: Sequence[Exchange], candidates: Sequence[Candidate], *, max_messages: int, max_chars: int) -> ThreadPlan:
+    """Decide where the newest message of a client's history runs.
+
+    ``history`` is everything the client sent (``exchanges()``), ending with the new message. A history
+    that is a stored conversation plus exactly one message continues that thread and ingests only the
+    new message. Any other history, including one that repeats the last message of a stored
+    conversation, starts a new thread seeded with everything before the new message; one too large to
+    seed raises a 400 (``check_ingest``) rather than being cut.
+    """
+    *earlier, newest = history
+    match = best_match(history, candidates)
+    if match is not None and match.continues(len(history)):
+        return ThreadPlan(thread_id=match.candidate.thread_id, message=newest.user, seed=())
+    seed = tuple(earlier)
+    check_ingest([*(message["content"] for message in seed_messages(seed)), newest.user], max_messages=max_messages, max_chars=max_chars)
+    return ThreadPlan(thread_id=None, message=newest.user, seed=seed)
