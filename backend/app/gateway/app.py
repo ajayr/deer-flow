@@ -40,6 +40,7 @@ from app.gateway.routers import (
     mcp_tasks,
     memory,
     models,
+    openai_compat,
     personal_mcp,
     plugins,
     project_documents,
@@ -1008,6 +1009,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down API Gateway")
 
 
+def _openai_compat_enabled() -> bool:
+    """Whether to mount the OpenAI-compatible API (``openai_compat.enabled``).
+
+    An absent config.yaml means "off": create_app() runs at import time, and the
+    lifespan still performs strict config loading before serving. A config.yaml
+    that exists but is invalid is a configuration failure and propagates.
+    """
+    try:
+        return get_app_config().openai_compat.enabled
+    except FileNotFoundError:
+        return False
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -1344,6 +1358,14 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
 
     # Stateless Runs API (stream/wait without a pre-existing thread)
     app.include_router(runs.router)
+
+    # OpenAI-compatible API (/api/openai/v1) for OpenAI-style clients such as Conduit.
+    # Off by default and read once here, so toggling openai_compat.enabled needs a
+    # Gateway restart. While it is off the routes do not exist at all: they are not
+    # registered and do not appear in OpenAPI.
+    if _openai_compat_enabled():
+        app.include_router(openai_compat.router)
+        logger.info("OpenAI-compatible API mounted at /api/openai/v1")
 
     # GitHub webhooks API is mounted at /api/webhooks/github
     # Exempt from auth and CSRF middleware (see auth_middleware._PUBLIC_PATH_PREFIXES
