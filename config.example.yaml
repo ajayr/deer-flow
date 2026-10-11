@@ -20,7 +20,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 60
+config_version: 61
 
 # Optional operator-owned literal prompt extensions (see CONFIGURATION.md):
 # lead_prompt_overlay:
@@ -2566,10 +2566,21 @@ agents_api:
 #   that offers none of `modes` is not listed.
 # - `default_mode` is the mode behind a bare model name. It must be one of
 #   `modes`, so narrow the two together.
+# - `on_disconnect` is what a client that drops its connection does to its run:
+#   `cancel` interrupts it (Stop works), `continue` lets it finish (a locked
+#   phone does not lose the answer, but Stop no longer stops the agent).
+# - `narration_window_chars` holds back that many characters of an answer to see
+#   whether a tool call follows; 0 streams all AI text as the answer.
+# - `max_ingest_messages` and `max_ingest_chars` cap the history a new thread is
+#   seeded with; a longer history is a 400 that asks for a new chat.
 openai_compat:
   enabled: false
   default_mode: thinking # flash | thinking | pro | ultra
   modes: [flash, thinking, pro, ultra]
+  on_disconnect: cancel # cancel | continue
+  narration_window_chars: 200
+  max_ingest_messages: 400
+  max_ingest_chars: 500000
 
 # ============================================================================
 # Skill Self-Evolution Configuration

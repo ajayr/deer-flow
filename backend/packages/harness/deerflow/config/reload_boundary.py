@@ -102,7 +102,7 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
     ),
     "openai_compat.enabled": (
         "create_app() mounts the OpenAI-compatible router (/api/openai/v1) once at startup, and only when this flag is true; "
-        "a freshly reloaded AppConfig neither adds nor removes routes, so toggling it needs a Gateway restart. openai_compat.default_mode and openai_compat.modes stay live-read."
+        "a freshly reloaded AppConfig neither adds nor removes routes, so toggling it needs a Gateway restart. Every other openai_compat key stays live-read."
     ),
     "projects.summaries_enabled": (
         "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
