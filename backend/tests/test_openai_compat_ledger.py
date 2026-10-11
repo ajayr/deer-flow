@@ -51,6 +51,24 @@ class _FailingStore(MemoryThreadMetaStore):
         await super().update_metadata(thread_id, metadata, touch=touch, user_id=user_id)
 
 
+class _GatedStore(MemoryThreadMetaStore):
+    """Holds reads of ``t1`` until ``t2``'s append has landed, so a lock shared by both threads would time out."""
+
+    def __init__(self, store):
+        super().__init__(store)
+        self.t2_written = asyncio.Event()
+
+    async def get(self, thread_id, *, user_id=AUTO):
+        if thread_id == "t1":
+            await asyncio.wait_for(self.t2_written.wait(), 1)
+        return await super().get(thread_id, user_id=user_id)
+
+    async def update_metadata(self, thread_id, metadata, *, touch=True, user_id=AUTO):
+        await super().update_metadata(thread_id, metadata, touch=touch, user_id=user_id)
+        if thread_id == "t2":
+            self.t2_written.set()
+
+
 @pytest.fixture
 def store():
     return MemoryThreadMetaStore(InMemoryStore())
@@ -382,13 +400,13 @@ async def test_recording_an_answer_and_appending_the_next_turn_do_not_overwrite_
 
 
 async def test_different_threads_do_not_wait_for_each_other(store):
-    interleaving = _InterleavingStore(store._store)
-    await _thread(interleaving, "t1", conv=CONV, turns=[])
-    await _thread(interleaving, "t2", conv=CONV, turns=[])
+    gated = _GatedStore(store._store)
+    await _thread(gated, "t1", conv=CONV, turns=[])
+    await _thread(gated, "t2", conv=CONV, turns=[])
 
     indexes = await asyncio.gather(
-        append_turns(interleaving, "t1", [_turn("a")], user_id=USER),
-        append_turns(interleaving, "t2", [_turn("b")], user_id=USER),
+        append_turns(gated, "t1", [_turn("a")], user_id=USER),
+        append_turns(gated, "t2", [_turn("b")], user_id=USER),
     )
 
     assert indexes == [0, 0]
