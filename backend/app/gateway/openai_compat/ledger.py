@@ -49,6 +49,8 @@ async def find_candidates(store: ThreadMetaStore, *, user_id: str, conv: str) ->
     A thread whose ledger cannot be read is left out: it cannot be continued, only replaced.
     """
     rows = await store.search(metadata={CONV_KEY: conv}, limit=CANDIDATE_LIMIT, user_id=user_id)
+    # search() lists pinned threads first; the tie-break here wants recency alone.
+    rows = sorted(rows, key=lambda row: (str(row.get("updated_at") or ""), str(row.get("thread_id") or "")), reverse=True)
     candidates = []
     for row in rows:
         turns = _stored_turns(row)
