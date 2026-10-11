@@ -32,6 +32,7 @@ TURNS_KEY = "openai_turns"
 CANDIDATE_LIMIT = 50
 
 # A ledger is rewritten whole, so two writers on the same thread must not interleave their read and write.
+# The lock holds only within one process and one event loop: writers in other processes or on other loops are not serialized.
 _ledger_locks = AsyncKeyedLockTable[str]()
 
 

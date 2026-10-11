@@ -21,8 +21,8 @@ This package is plain Python: it imports neither FastAPI nor Starlette, and the 
 
 `conversation.py` decides whether a resent history continues a thread or starts a new one, and `ledger.py` keeps the hashes it compares in the thread's own metadata (`openai_conv`, `openai_turns`). `ledger.py` is the only module here that touches a store, through an injected `ThreadMetaStore`. Keep these rules:
 
-- Store hashes of whitespace-normalised text, never the text. Seeding never truncates a history; the ingest caps reject it.
-- A failed ledger write is logged and the run goes ahead; the next request is then treated as a new conversation. It never fails a request.
+- Store hashes of whitespace-normalized text, never the text. Seeding never truncates a history; the ingest caps reject it.
+- A failed ledger write is logged and the run goes ahead. A lost append makes the next request seed a new thread; a lost answer only weakens tie-breaks.
 
 `translator.py` is the only place that decides what a client sees of a run. It is pure (no I/O, no clock, no FastAPI): the router passes it each stream frame and the current monotonic time. Its docstrings hold the routing rules; `errors.py` holds the fixed in-band error messages, which carry nothing from the failure. Keep these invariants:
 
