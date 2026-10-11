@@ -1261,13 +1261,16 @@ reference: [API Reference — Personal Access Tokens](backend/docs/API.md#person
 #### OpenAI-compatible API
 
 The Gateway can serve an OpenAI-style API at `/api/openai/v1` for clients such as
-the Conduit iOS app in its Direct mode. It currently serves the model listing
-only: `GET /api/openai/v1/models`, which takes a PAT that carries `runs:create`.
-The API is off by default: set `openai_compat.enabled: true` in `config.yaml` and
-restart the Gateway. The listing offers the caller's models as `<model>` and as
-`<model>:<mode>` variants (`flash`, `thinking`, `pro`, `ultra`); each model's
-reasoning contract, `openai_compat.default_mode` and `openai_compat.modes` shape
-that list. Full
+the Conduit iOS app in its Direct mode. The API is off by default: set
+`openai_compat.enabled: true` in `config.yaml` and restart the Gateway. Both
+routes take a PAT. `GET /api/openai/v1/models` needs `runs:create` and offers the
+caller's models as `<model>` and as `<model>:<mode>` variants (`flash`,
+`thinking`, `pro`, `ultra`); each model's reasoning contract,
+`openai_compat.default_mode` and `openai_compat.modes` shape that list.
+`POST /api/openai/v1/chat/completions` answers a conversation the client resends
+in full, streamed or not, with the agent's progress as `reasoning_content`; each
+conversation becomes a thread of the token's user, so the PAT also needs
+`runs:read`, `threads:read` and `threads:write`. Full
 reference: [API Reference — OpenAI-compatible API](backend/docs/API.md#openai-compatible-api)
 and [Configuration](backend/docs/CONFIGURATION.md#openai-compatible-api).
 
