@@ -14,6 +14,7 @@ EXPECTED_GUIDANCE_PATHS = {
     "frontend/AGENTS.md",
     "backend/app/gateway/AGENTS.md",
     "backend/app/gateway/routers/AGENTS.md",
+    "backend/app/gateway/openai_compat/AGENTS.md",
     "backend/app/channels/AGENTS.md",
     "backend/packages/harness/deerflow/AGENTS.md",
     "backend/packages/harness/deerflow/agents/AGENTS.md",

@@ -1,0 +1,16 @@
+# OpenAI-compatible API
+
+`routers/openai_compat.py` serves `/api/openai/v1` for OpenAI-style clients such as the Conduit iOS app in Direct mode. `create_app()` mounts it once at startup, and only when `openai_compat.enabled` is true (a startup-only field in `reload_boundary.py`); with the flag off the routes are not registered and are absent from OpenAPI. `default_mode` and `modes` are read on every request.
+
+Every route carries `@require_permission("runs", "create")` and has its own entry in `auth/pat.py::_PAT_ROUTE_RULES`, so an ordinary PAT with `runs:create` is the credential. The PAT test derives its expectation from the router: a route added here fails `test_pat_openai_compat_policy_admits_exactly_the_mounted_routes` until it is allowlisted. The `/api/openai/` nginx location (in all three configs) carries the large-body, unspooled-request settings that a conversation resent on every request needs; `tests/test_nginx_openai_compat_route.py` pins them.
+
+This package is plain Python: it imports neither FastAPI nor Starlette, and the router is the only module that does, so the logic tests without an app. `schemas.py` holds the response models.
+
+`modes.py` builds the ids a caller can send as `model`: the bare name (`default_mode`, clamped to the model's reasoning contract) and one `<model>:<mode>` variant per mode that the contract allows and `modes` lists, in the order flash, thinking, pro, ultra. Keep these rules:
+
+- Build the catalogue from `list_models()` output, never from `config.models`. That keeps model authorization and its fail-closed handling, and a model hidden from the caller can neither leak its name nor take a variant id from a visible model.
+- A name equal to a model the caller can use always means that model, so a colliding variant id is skipped. Resolve a requested `model` the same way: it must equal an id that `GET /models` lists for the caller, compared exactly (no case folding, no trimming, no splitting at a colon).
+- A model that offers no mode is not listed; one that offers a single mode is listed by its bare name only.
+- Every entry advertises `ADVERTISED_CONTEXT_LENGTH` and `is_multimodal: false`. Conduit falls back to a 4096-token window when the length is missing and then trims the history it resends, and it treats a missing flag as multimodal. Do not substitute a model's real window.
+
+Config lives in `deerflow/config/openai_compat_config.py`. A new key needs `config.example.yaml`, `docs/CONFIGURATION.md` and `tests/test_openai_compat_docs.py` updated together.
