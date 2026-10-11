@@ -341,6 +341,20 @@ def test_an_unclosed_think_block_is_reasoning_to_the_end_of_the_message():
     assert run.translator.content_text == ""
 
 
+@pytest.mark.parametrize(
+    "reasoning",
+    [ai(reasoning="I should search the docs."), ai([{"type": "thinking", "thinking": "I should search the docs."}]), ai("<think>I should search the docs.</think>")],
+    ids=["additional_kwargs", "thinking_block", "think_tag"],
+)
+def test_narration_after_reasoning_that_ends_mid_line_starts_a_paragraph_of_its_own(reasoning):
+    run = Run()
+    run.send(reasoning)
+    run.send(ai("Let me look that up."))
+
+    assert shape(run.send(ai(calls=[call("web_search")]))) == [("reasoning", "\n\nLet me look that up."), ("reasoning", "\nTool web_search: running\n")]
+    assert run.translator.reasoning_text == "I should search the docs.\n\nLet me look that up.\nTool web_search: running\n"
+
+
 # ── tool calls and results ───────────────────────────────────────────────────
 
 
