@@ -79,7 +79,7 @@ POLICY: tuple[ParamRule, ...] = (
     ParamRule("model", "honored", "Required. An id from `GET /models`: `<model>` or `<model>:<mode>`."),
     ParamRule("messages", "honored", "Required. The conversation as user and assistant text messages; see Messages."),
     ParamRule("stream", "honored", "`true` streams `chat.completion.chunk` events; `false` or absent returns one JSON body."),
-    ParamRule("stream_options.include_usage", "honored", "`true` adds a final chunk with the run's token totals."),
+    ParamRule("stream_options.include_usage", "honored", "`true` adds a final chunk with the run's token totals, unless the model provider reported none."),
     ParamRule("reasoning_effort", "honored", "Overrides the variant's default effort. A value the model does not accept is a 400; a variant without thinking, or a model without an effort control, ignores and reports it."),
     # -- ignored: accepted, not acted on, reported -----------------------------------------------
     ParamRule("temperature", "ignored", _SAMPLING),
