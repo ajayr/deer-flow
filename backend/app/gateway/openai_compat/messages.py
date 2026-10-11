@@ -9,6 +9,7 @@ never believes it sent something the agent did not receive. Fields that do not c
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -29,6 +30,9 @@ _NOT_YET = {
     "input_audio": "Audio input is not supported yet.",
     "file": "File input is not supported yet.",
 }
+
+#: A lone UTF-16 surrogate: ``json.loads`` lets one through, and text that holds one cannot be encoded as UTF-8.
+_UNPAIRED_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +112,8 @@ def parse_messages(raw: Any) -> ParsedMessages:
             if value is not None and key not in _KEPT_KEYS and key not in MESSAGE_REJECTED:
                 ignored[f"messages[].{safe_name(key)}"] = None
         text = _text_of(item.get("content"), param)
+        if _UNPAIRED_SURROGATE.search(text):
+            raise invalid_message("Message text is not valid Unicode: it holds an unpaired surrogate. Remove the broken character and retry.", param=f"{param}.content")
         if role == "user" and not text.split():
             raise invalid_message("A user message needs some text.", param=param)
         messages.append(ChatMessage(role=role, text=text))

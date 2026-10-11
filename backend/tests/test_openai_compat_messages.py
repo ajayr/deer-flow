@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tracemalloc
 
 import pytest
@@ -173,6 +174,30 @@ def test_a_part_type_that_is_not_a_string_is_not_quoted_back():
 
     assert error.param == "messages[0].content[0].type"
     assert peak < 1_000_000
+
+
+@pytest.mark.parametrize(
+    ("raw", "param"),
+    [
+        ([_user("a\ud800b")], "messages[0].content"),
+        ([_user([{"type": "text", "text": "ok"}, {"type": "text", "text": "\udfff"}])], "messages[0].content"),
+        ([_user(), _assistant("\ud83d"), _user()], "messages[1].content"),
+    ],
+)
+def test_text_with_an_unpaired_surrogate_is_refused(raw, param):
+    error = _refusal(raw)
+
+    assert (error.code, error.param) == ("invalid_message", param)
+    assert "unpaired surrogate" in error.message
+
+
+@pytest.mark.parametrize("body", [b'[{"role": "user", "content": "a\xed\xa0\x80b"}]', '[{"role": "user", "content": "a\\ud800b"}]'])
+def test_a_surrogate_that_json_decoding_lets_through_is_refused(body):
+    assert _refusal(json.loads(body)).param == "messages[0].content"
+
+
+def test_an_escaped_surrogate_pair_is_one_character_and_is_kept():
+    assert _texts(json.loads('[{"role": "user", "content": "hi \\ud83d\\ude00"}]')) == [("user", "hi \U0001f600")]
 
 
 def test_a_part_must_be_an_object_with_text():
