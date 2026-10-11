@@ -118,7 +118,7 @@ async def list_openai_models(request: Request, config: AppConfig = Depends(get_c
         400: {"model": ErrorResponse, "description": "A malformed request, an unsupported parameter or message, or a history too large to import."},
         404: {"model": ErrorResponse, "description": "The model is not one that `GET /models` lists for the caller."},
         409: {"model": ErrorResponse, "description": "A run is active in the conversation, or (with `stream: false`) the run was stopped."},
-        500: {"model": ErrorResponse, "description": "The request failed before the agent started."},
+        500: {"model": ErrorResponse, "description": "The request failed before the agent started, or (with `stream: false`) while its answer was being collected."},
         502: {"model": ErrorResponse, "description": "With `stream: false`: the model provider failed or the answer was lost. A stream reports these in-band."},
         **_AUTH_ERRORS,
     },

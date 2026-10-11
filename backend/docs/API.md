@@ -592,7 +592,8 @@ restart the Gateway (see [Configuration](CONFIGURATION.md#openai-compatible-api)
 While it is off the routes do not exist and are not part of the OpenAPI schema.
 
 Authenticate with a [personal access token](#personal-access-tokens), sent as
-`Authorization: Bearer dfp_...`; a browser session works too. `GET /models` needs the
+`Authorization: Bearer dfp_...`; a browser session works too, and a `POST` from it also
+needs the `X-CSRF-Token` header. `GET /models` needs the
 `runs:create` scope, and `POST /chat/completions` needs `runs:create`, `runs:read`,
 `threads:read` and `threads:write`. A token without a required scope gets `403` with
 `Permission denied: <scope>`, and a missing or invalid credential gets `401`.
@@ -742,7 +743,7 @@ rejected with a `400` that says why. A value of `null` counts as absent.
 | `model` | Honored | Required. An id from `GET /models`: `<model>` or `<model>:<mode>`. |
 | `messages` | Honored | Required. The conversation as user and assistant text messages; see Messages. |
 | `stream` | Honored | `true` streams `chat.completion.chunk` events; `false` or absent returns one JSON body. |
-| `stream_options.include_usage` | Honored | `true` adds a final chunk with the run's token totals. |
+| `stream_options.include_usage` | Honored | `true` adds a final chunk with the run's token totals, unless the model provider reported none. |
 | `reasoning_effort` | Honored | Overrides the variant's default effort. A value the model does not accept is a 400; a variant without thinking, or a model without an effort control, ignores and reports it. |
 | `temperature` | Ignored, reported | The model profile sets sampling. |
 | `top_p` | Ignored, reported | The model profile sets sampling. |
@@ -798,10 +799,12 @@ control.
 `delta.reasoning_content` (the agent's reasoning and one line per tool or subagent,
 such as `Tool web_search: running`) and `delta.content` (the answer), a chunk with
 `finish_reason: "stop"`, a final chunk with `usage` and an empty `choices` list when
-`stream_options.include_usage` is true, and `data: [DONE]`. The first words of each
-agent message are held back for up to a second (`openai_compat.narration_window_chars`)
-to see whether a tool call follows. If one does, they were narration and travel as
-`reasoning_content`. A run that produces no answer text repeats the agent's last text
+`stream_options.include_usage` is true and the model provider reported token counts,
+and `data: [DONE]`. The first words of each agent message are held back, at most
+`openai_compat.narration_window_chars` characters for at most a second, to see whether
+a tool call follows. If one does, they were narration and travel as
+`reasoning_content`; narration that outruns the window or the second has already gone
+out as `content`. A run that produces no answer text repeats the agent's last text
 as `content`. While the agent is quiet the stream sends the SSE comment `: keepalive`
 every 5 seconds, and a `Still working... (N min)` line after every two minutes
 without output. When the agent asks the user something (a clarifying question, or a
@@ -872,7 +875,7 @@ exception.
 | 400 | `context_length_exceeded` | `messages` | The history is too large to import into a new thread. |
 | 404 | `model_not_found` | `model` | The model is not an id `GET /models` lists for the caller. |
 | 409 | `conversation_busy` | none | The conversation's thread has a run in flight. |
-| 500 | `internal_error` | none | The request failed before the agent started. |
+| 500 | `internal_error` | none | The request failed before the agent started, or (with `stream: false`) while its answer was being collected. |
 
 A run that fails after the stream has started cannot change the HTTP status, so the
 failure is sent as one more `data:` payload and the stream closes **without**
