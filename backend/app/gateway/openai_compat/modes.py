@@ -92,19 +92,19 @@ def build_catalogue(
     * A variant id that equals the name of a model the caller can use is skipped,
       so ids stay unique and the configured model wins. Only the caller's own
       models count: a model hidden from them must not change what they see.
-    * A model name that repeats keeps its first entry, as ``AppConfig.get_model_config`` does.
+    * A model name that repeats keeps its first entry, as ``AppConfig.get_model_config`` does, even when that entry offers no mode.
     """
     reserved = {model.name for model in models}
-    listed: set[str] = set()
+    seen: set[str] = set()
     entries: list[CatalogueEntry] = []
     for model in models:
-        if model.name in listed:
+        if model.name in seen:
             continue
+        seen.add(model.name)
         offered = offered_modes(model.thinking, configured_modes)
         bare = bare_mode(model.thinking, configured_modes, default_mode)
         if bare is None:
             continue
-        listed.add(model.name)
         label = model.display_name or model.name
         entries.append(CatalogueEntry(id=model.name, name=label, description=model.description, model_name=model.name, mode=bare))
         if len(offered) < 2:
