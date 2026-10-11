@@ -147,7 +147,7 @@ Revocation is immediate.
   `join`/`messages`/`events`/`workspace-changes` (GET), and
   `GET|POST .../runs/{run_id}/stream`), plus `POST /api/runs/stream|wait` and
   `GET /api/runs/{run_id}/messages|feedback`, and, when `openai_compat.enabled`
-  is true, `GET /api/openai/v1/models` (see
+  is true, `GET /api/openai/v1/models` and `POST /api/openai/v1/chat/completions` (see
   [OpenAI-compatible API](#openai-compatible-api)). A route added under `/runs`
   is denied until explicitly added to the policy.
   Every other authenticated route — memory, agents, models, MCP/skills
@@ -591,11 +591,12 @@ The API is off by default. Set `openai_compat.enabled: true` in `config.yaml` an
 restart the Gateway (see [Configuration](CONFIGURATION.md#openai-compatible-api)).
 While it is off the routes do not exist and are not part of the OpenAPI schema.
 
-Authenticate with a [personal access token](#personal-access-tokens) that carries
-the `runs:create` scope, sent as `Authorization: Bearer dfp_...`; a browser
-session works too. A token without `runs:create` gets `403` with
-`Permission denied: runs:create`, and a missing or invalid credential gets `401`.
-Errors use the Gateway's usual `{"detail": ...}` body.
+Authenticate with a [personal access token](#personal-access-tokens), sent as
+`Authorization: Bearer dfp_...`; a browser session works too. `GET /models` needs the
+`runs:create` scope, and `POST /chat/completions` needs `runs:create`, `runs:read`,
+`threads:read` and `threads:write`. A token without a required scope gets `403` with
+`Permission denied: <scope>`, and a missing or invalid credential gets `401`.
+Authentication errors use the Gateway's usual `{"detail": ...}` body.
 
 ### List Models (OpenAI-style)
 
@@ -655,6 +656,247 @@ every model, so narrowing it can hide a model.
 large `context_length` and `is_multimodal: false`: clients such as Conduit fall
 back to a 4096-token window when the length is missing, and treat a missing flag
 as multimodal. `description` is left out when the model has none.
+
+### Create Chat Completion (OpenAI-style)
+
+```http
+POST /api/openai/v1/chat/completions
+```
+
+Runs the agent on the newest message of a conversation and answers in the OpenAI
+`chat.completion` shape or, with `stream: true`, as `chat.completion.chunk`
+server-sent events that end with `data: [DONE]`. The agent runs its own tools on the
+server. Its progress arrives as `reasoning_content`, and `tool_calls` are never
+returned.
+
+**Credentials.** A [personal access token](#personal-access-tokens) with
+`runs:create`, `runs:read`, `threads:read` and `threads:write`: the route creates and
+updates the caller's threads and reads their runs. A token that lacks one gets `403`
+with `Permission denied: <scope>`, an unknown or malformed token gets `401` with
+`{"detail": "Invalid token"}`, and a POST with no credential at all is stopped by the
+CSRF layer with `403` (`CSRF token missing`). Those, and the `403`
+`Model '<name>' is not available for your role` that role-based model authorization
+gives, keep the Gateway's `{"detail": ...}` body. Every other error is in the OpenAI
+envelope described under Errors.
+
+**Request.**
+
+```json
+{
+  "model": "minimax:pro",
+  "stream": true,
+  "stream_options": {"include_usage": true},
+  "messages": [
+    {"role": "user", "content": "What is the capital of France?"},
+    {"role": "assistant", "content": "Paris."},
+    {"role": "user", "content": "How many people live there?"}
+  ]
+}
+```
+
+**Conversations.** OpenAI-style clients send the whole conversation on every request
+and no conversation id. The Gateway keeps each conversation as a thread of the token's
+user and recognizes it by its user messages:
+
+- A history that is a stored conversation's user messages plus exactly one new message
+  continues that thread, and only the new message is run. Whitespace differences are
+  ignored. Assistant text only breaks a tie between threads that match the history
+  equally well, because clients reformat it. Only the 50 most recently updated
+  threads that started with the same first message are considered.
+- Any other history starts a new thread. That covers a first message, an edited
+  earlier message, and the same last message sent again. The new thread is seeded with
+  the client's earlier messages (text only, as user and assistant messages) and the
+  newest message is run. A thread seeded this way is titled with the first user
+  message, cut to `title.max_chars` or 50 characters, whichever is shorter; a thread
+  that starts with a first message is titled like any other thread.
+- Seeding is refused with `400` `context_length_exceeded` when the messages to write
+  (the earlier ones and the new one) number more than `openai_compat.max_ingest_messages`
+  or hold more than `openai_compat.max_ingest_chars` characters. The history is never
+  cut. A request that continues a thread is not checked.
+- A request that arrives while the conversation's thread is still running gets `409`
+  `conversation_busy` and changes nothing.
+
+Every conversation is an ordinary thread in the web UI, and deleting a chat in a
+client does not delete its thread. The thread's metadata holds hashes of the messages
+it was sent (`openai_conv`, `openai_turns`), never their text.
+
+**Messages.** Only `user` and `assistant` messages with text are accepted, as a string
+or as a list of `{"type": "text"}` parts. The first and the last message must be
+`user` messages, every `user` message needs some text, and an `assistant` message with
+no text is skipped. `system`, `developer` and `tool` messages, and content that is not
+text (images, audio, files), are refused with `400` `invalid_message`. A message that
+carries `tool_calls` (an empty list is accepted), `function_call`, `tool_call_id` or
+`audio` is refused with `400` `unsupported_parameter`. In both cases `param` names the
+field, for example `messages[0].role`. Text that holds an unpaired surrogate (a broken
+character, such as half of an emoji) is refused with `400` `invalid_message` as well;
+`param` is `messages[i].content`. Keys of a text part other than `type` and `text`, such
+as `cache_control`, are ignored and named in `X-DeerFlow-Ignored-Params` as
+`messages[].content[].<key>`.
+
+**Parameters.** Nothing is dropped silently. A parameter is honored, or ignored and
+named in the `X-DeerFlow-Ignored-Params` response header (names only, at most 20), or
+rejected with a `400` that says why. A value of `null` counts as absent.
+
+| Parameter | Handling | Notes |
+|---|---|---|
+| `model` | Honored | Required. An id from `GET /models`: `<model>` or `<model>:<mode>`. |
+| `messages` | Honored | Required. The conversation as user and assistant text messages; see Messages. |
+| `stream` | Honored | `true` streams `chat.completion.chunk` events; `false` or absent returns one JSON body. |
+| `stream_options.include_usage` | Honored | `true` adds a final chunk with the run's token totals. |
+| `reasoning_effort` | Honored | Overrides the variant's default effort. A value the model does not accept is a 400; a variant without thinking, or a model without an effort control, ignores and reports it. |
+| `temperature` | Ignored, reported | The model profile sets sampling. |
+| `top_p` | Ignored, reported | The model profile sets sampling. |
+| `presence_penalty` | Ignored, reported | The model profile sets sampling. |
+| `frequency_penalty` | Ignored, reported | The model profile sets sampling. |
+| `seed` | Ignored, reported | The model profile sets sampling. |
+| `max_tokens` | Ignored, reported | The agent decides its own length; a run ends at the configured recursion limit. |
+| `max_completion_tokens` | Ignored, reported | The agent decides its own length; a run ends at the configured recursion limit. |
+| `stop` | Ignored, reported | The agent decides its own length; a run ends at the configured recursion limit. |
+| `user` | Ignored, reported | The access token is the identity. |
+| `metadata` | Ignored, reported | The thread is the conversation; nothing is stored for the client. |
+| `store` | Ignored, reported | The thread is the conversation; nothing is stored for the client. |
+| `service_tier` | Ignored, reported | Not applicable: the operator's model configuration picks the provider and its tier. |
+| `parallel_tool_calls` | Ignored, reported | Not applicable: the agent runs its own tools. |
+| `stream_options.*` | Ignored, reported | Any `stream_options` key other than `include_usage`. |
+| `messages[].name` | Ignored, reported | Ignored on every message. |
+| `messages[].reasoning_content` | Ignored, reported | Clients echo these back from earlier replies; ignored. |
+| `messages[].reasoning` | Ignored, reported | Clients echo these back from earlier replies; ignored. |
+| `messages[].reasoning_details` | Ignored, reported | Clients echo these back from earlier replies; ignored. |
+| `messages[].refusal` | Ignored, reported | Clients echo these back from earlier replies; ignored. |
+| `messages[].annotations` | Ignored, reported | Clients echo these back from earlier replies; ignored. |
+| `messages[].content[].*` | Ignored, reported | Any key of a text part other than `type` and `text`, such as `cache_control`. |
+| `*` | Ignored, reported | Any other field, at the top level or on a message. |
+| `tools` | Rejected (400) | Only an empty list is accepted. |
+| `functions` | Rejected (400) | Only an empty list is accepted. |
+| `tool_choice` | Rejected (400) | Only `none` is accepted. |
+| `n` | Rejected (400) | Only `1` is accepted. |
+| `response_format` | Rejected (400) | Only `{"type": "text"}` is accepted. |
+| `logprobs` | Rejected (400) | Only `false` is accepted. |
+| `top_logprobs` | Rejected (400) | Not accepted. |
+| `logit_bias` | Rejected (400) | Only an empty object is accepted. |
+| `modalities` | Rejected (400) | Only `["text"]` is accepted. |
+| `audio` | Rejected (400) | Not accepted. |
+| `prediction` | Rejected (400) | Not accepted. |
+| `web_search_options` | Rejected (400) | Not accepted. |
+| `messages[].tool_calls` | Rejected (400) | Only an empty list is accepted. |
+| `messages[].function_call` | Rejected (400) | Not accepted. |
+| `messages[].tool_call_id` | Rejected (400) | Not accepted. |
+| `messages[].audio` | Rejected (400) | Not accepted. |
+
+**Models, modes and reasoning effort.** `model` must be an id that `GET /models` lists
+for the caller, character for character. A bare model name runs in
+`openai_compat.default_mode`, adjusted to what the model's reasoning contract allows,
+and `<model>:<mode>` runs in that mode. `flash` has no thinking, `thinking` thinks,
+`pro` thinks and plans, and `ultra` thinks, plans and may spawn subagents. When the
+request names no `reasoning_effort`, a model that has an effort control gets `low`
+for `thinking`, `medium` for `pro` and `high` for `ultra`, and none for `flash`. A
+value you send must be one the model's reasoning contract accepts, including its
+aliases. It is ignored and reported for `flash` and for a model without an effort
+control.
+
+**Response.** A stream starts with a chunk that carries `delta.role`. Then come
+`delta.reasoning_content` (the agent's reasoning and one line per tool or subagent,
+such as `Tool web_search: running`) and `delta.content` (the answer), a chunk with
+`finish_reason: "stop"`, a final chunk with `usage` and an empty `choices` list when
+`stream_options.include_usage` is true, and `data: [DONE]`. The first words of each
+agent message are held back for up to a second (`openai_compat.narration_window_chars`)
+to see whether a tool call follows. If one does, they were narration and travel as
+`reasoning_content`. A run that produces no answer text repeats the agent's last text
+as `content`. While the agent is quiet the stream sends the SSE comment `: keepalive`
+every 5 seconds, and a `Still working... (N min)` line after every two minutes
+without output. When the agent asks the user something (a clarifying question, or a
+sandbox network approval that only the web UI can grant), the run ends there and the
+question is the answer.
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream; charset=utf-8
+Cache-Control: no-cache, no-transform
+X-Accel-Buffering: no
+X-DeerFlow-Ignored-Params: temperature
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[{"index":0,"delta":{"reasoning_content":"Tool web_search: running\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[{"index":0,"delta":{"reasoning_content":"Tool web_search: done\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[{"index":0,"delta":{"content":"About 2.1 million people live in Paris."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-a82fac3e-ca8f-4737-baa2-bcb134b171a6","object":"chat.completion.chunk","created":1791679370,"model":"minimax:pro","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}
+
+data: [DONE]
+```
+
+With `stream: false` the same run is consumed and one JSON body is returned: the
+answer in `message.content`, the progress in `message.reasoning_content` (left out
+when there is none), `finish_reason: "stop"`, and `usage` with the run's token totals
+(zeros when the model provider reported none). `id` is `chatcmpl-` followed by the run
+id. Prefer streaming for anything that takes more than a few seconds, because proxies
+and clients cut long idle requests.
+
+```json
+{
+  "id": "chatcmpl-2341bd00-0ea7-4c89-b838-30726f13065a",
+  "object": "chat.completion",
+  "created": 1791679370,
+  "model": "minimax:pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "About 2.1 million people live in Paris.",
+        "reasoning_content": "Tool web_search: running\nTool web_search: done\n"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+}
+```
+
+**Errors.** A request that fails before the agent starts gets an HTTP status and the
+OpenAI error envelope `{"error": {"message", "type", "param", "code"}}`. Messages are
+short, quote at most 40 characters of the request, and carry nothing from an
+exception.
+
+| Status | `code` | `param` | When |
+|---|---|---|---|
+| 400 | `invalid_request` | the field, if any | The body is not JSON, not an object, or a field has the wrong type. |
+| 400 | `unsupported_parameter` | the parameter | A rejected parameter or message field (see Parameters and Messages). |
+| 400 | `unsupported_value` | the parameter | A rejected parameter with a value that is not accepted, or a `reasoning_effort` the model does not accept. |
+| 400 | `invalid_message` | `messages[i]...` | A message breaks the message rules, or its text is not valid Unicode (an unpaired surrogate). |
+| 400 | `context_length_exceeded` | `messages` | The history is too large to import into a new thread. |
+| 404 | `model_not_found` | `model` | The model is not an id `GET /models` lists for the caller. |
+| 409 | `conversation_busy` | none | The conversation's thread has a run in flight. |
+| 500 | `internal_error` | none | The request failed before the agent started. |
+
+A run that fails after the stream has started cannot change the HTTP status, so the
+failure is sent as one more `data:` payload and the stream closes **without**
+`[DONE]`:
+
+```
+data: {"error":{"message":"The model provider failed while answering. Send the message again to retry.","type":"server_error","param":null,"code":"run_error"}}
+```
+
+The in-band codes are `run_error` (the model provider or the run failed, including a
+timeout), `empty_response` (the agent finished without an answer), `run_interrupted`
+(the run was stopped), `stream_gap` (part of the stream was lost; the run itself is not
+cancelled) and `internal_error`. With `stream: false` the same codes come back as an
+ordinary error response: `502` for `run_error`, `empty_response` and `stream_gap`,
+`409` for `run_interrupted` and `500` for `internal_error`.
+
+A failure is reported only once the run has ended, or after 3 seconds if it has not
+ended by then, so a message sent again right away normally finds the conversation idle.
+If the run is still finishing, the retry gets `conversation_busy` and can be sent again.
+
+**When the client leaves.** `openai_compat.on_disconnect` decides what a dropped
+connection does to its run: `cancel` (the default) interrupts it and `continue` lets
+it finish (see [Configuration](CONFIGURATION.md#openai-compatible-api)). A stream that
+fails or is lost does not cancel its run.
 
 ---
 

@@ -140,6 +140,7 @@ to a boundary (SQLite) or causing the search to fail (PostgreSQL).
 |-------|---------|
 | `GET /api/models` | List available LLM models |
 | `GET /api/openai/v1/models` | OpenAI-style model listing for OpenAI-compatible clients (mounted only when `openai_compat.enabled`; PAT with `runs:create`) |
+| `POST /api/openai/v1/chat/completions` | OpenAI-style chat completion, streamed or not, on a conversation the client resends in full (mounted only when `openai_compat.enabled`; PAT with `runs:create`, `runs:read`, `threads:read`, `threads:write`) |
 | `GET/PUT /api/mcp/config` | Manage MCP server configurations |
 | `POST /api/mcp/cache/reset` | Reset cached MCP tools so they reload on next use |
 | `GET /api/skills` | List skills visible to the caller |
@@ -298,7 +299,7 @@ backend/
 ├── app/                        # FastAPI Gateway + IM channels (import: app.*)
 │   ├── gateway/                # Gateway API
 │   │   ├── app.py              # Application setup
-│   │   ├── openai_compat/      # OpenAI-compatible API support (model ids, schemas)
+│   │   ├── openai_compat/      # OpenAI-compatible API support (model ids, request policy, conversations, stream translation)
 │   │   └── routers/            # Route modules
 │   └── channels/               # IM channel integrations
 ├── docs/                       # Documentation

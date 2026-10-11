@@ -1625,8 +1625,9 @@ title:
 ### OpenAI-compatible API
 
 The Gateway can serve an OpenAI-style API at `/api/openai/v1` for clients such as
-the Conduit iOS app (in its Direct mode). It currently serves the model listing
-only (`GET /api/openai/v1/models`). It is off by default:
+the Conduit iOS app (in its Direct mode). It serves the model listing
+(`GET /api/openai/v1/models`) and chat completions
+(`POST /api/openai/v1/chat/completions`). It is off by default:
 
 ```yaml
 openai_compat:
@@ -1642,7 +1643,7 @@ openai_compat:
 Notes:
 
 - `enabled` mounts the routes once at startup, so changing it needs a Gateway restart. While it is `false` the routes are not registered and do not appear in the OpenAPI schema.
-- Clients authenticate with a [personal access token](API.md#personal-access-tokens) that carries the `runs:create` scope.
+- Clients authenticate with a [personal access token](API.md#personal-access-tokens). Listing models needs the `runs:create` scope; chat completions also need `runs:read`, `threads:read` and `threads:write`, because every conversation is a thread of the token's user.
 - The models a caller may use are offered as `<model>` and as `<model>:<mode>` variants (for example `minimax:pro`). The modes are the web UI's: `flash` is fast without extended reasoning, `thinking` reasons before it acts, `pro` adds planning and `ultra` adds subagents. A model's reasoning contract limits them: a model without thinking offers only `flash`, a model that always thinks never offers `flash`, a model left with a single mode is listed by its bare name alone, and a model left with no mode is not listed at all. Narrowing `modes` can therefore hide a model: with `modes: [thinking, pro, ultra]`, a model without thinking is not listed.
 - `default_mode` is the mode behind a bare model name. It is clamped to the model's reasoning contract; when the clamped mode is not in `modes`, the model's first offered mode is used. `default_mode` must be one of `modes`, so narrow the two together: `modes: [flash]` alone fails validation because `default_mode` is still `thinking`.
 - `modes` is a non-empty list without duplicates, drawn from `flash`, `thinking`, `pro` and `ultra`. Its order does not matter: the model list always uses the order above.
