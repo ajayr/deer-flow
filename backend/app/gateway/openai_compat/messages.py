@@ -93,7 +93,7 @@ def parse_messages(raw: Any) -> ParsedMessages:
     if not isinstance(raw, list) or not raw:
         raise invalid_request("'messages' is required and must be a non-empty list.", param="messages")
     messages: list[ChatMessage] = []
-    ignored: list[str] = []
+    ignored: dict[str, None] = {}
     for index, item in enumerate(raw):
         param = f"messages[{index}]"
         if not isinstance(item, Mapping):
@@ -105,9 +105,7 @@ def parse_messages(raw: Any) -> ParsedMessages:
                 raise rule.rejection(f"{param}.{key}")
         for key, value in item.items():
             if value is not None and key not in _KEPT_KEYS and key not in MESSAGE_REJECTED:
-                name = f"messages[].{safe_name(key)}"
-                if name not in ignored:
-                    ignored.append(name)
+                ignored[f"messages[].{safe_name(key)}"] = None
         text = _text_of(item.get("content"), param)
         if role == "user" and not text.split():
             raise invalid_message("A user message needs some text.", param=param)
