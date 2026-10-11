@@ -615,8 +615,9 @@ mode it offers, for example `minimax`, `minimax:flash`, `minimax:thinking`,
 without extended reasoning, `thinking` reasons before it acts, `pro` adds planning
 and `ultra` adds subagents. A model's reasoning contract limits them: a model
 without thinking offers only `flash`, a model that always thinks never offers
-`flash`, and a model left with a single mode is listed by its bare name alone.
-`openai_compat.modes` narrows the offer for every model.
+`flash`, a model left with a single mode is listed by its bare name alone, and a
+model left with no mode is not listed. `openai_compat.modes` narrows the offer for
+every model, so narrowing it can hide a model.
 
 **Response:**
 

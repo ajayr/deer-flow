@@ -1282,12 +1282,14 @@ reference: [API Reference — Personal Access Tokens](backend/docs/API.md#person
 
 #### OpenAI-compatible API
 
-OpenAI-style clients, such as the Conduit iOS app in its Direct mode, can reach
-the agent through `/api/openai/v1` with a PAT that carries `runs:create`. The API
-is off by default: set `openai_compat.enabled: true` in `config.yaml` and restart
-the Gateway. `GET /api/openai/v1/models` lists every model the caller may use as
-`<model>` and as `<model>:<mode>` variants (`flash`, `thinking`, `pro`, `ultra`);
-`openai_compat.default_mode` and `openai_compat.modes` shape that list. Full
+The Gateway can serve an OpenAI-style API at `/api/openai/v1` for clients such as
+the Conduit iOS app in its Direct mode. It currently serves the model listing
+only: `GET /api/openai/v1/models`, which takes a PAT that carries `runs:create`.
+The API is off by default: set `openai_compat.enabled: true` in `config.yaml` and
+restart the Gateway. The listing offers the caller's models as `<model>` and as
+`<model>:<mode>` variants (`flash`, `thinking`, `pro`, `ultra`); each model's
+reasoning contract, `openai_compat.default_mode` and `openai_compat.modes` shape
+that list. Full
 reference: [API Reference — OpenAI-compatible API](backend/docs/API.md#openai-compatible-api)
 and [Configuration](backend/docs/CONFIGURATION.md#openai-compatible-api).
 
