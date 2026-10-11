@@ -20,7 +20,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 59
+config_version: 60
 
 # Optional operator-owned literal prompt extensions (see CONFIGURATION.md):
 # lead_prompt_overlay:
@@ -2550,6 +2550,24 @@ blob_storage:
 # Keep this disabled unless the gateway is behind a trusted authenticated admin boundary.
 agents_api:
   enabled: false
+
+# ============================================================================
+# OpenAI-compatible API
+# ============================================================================
+# Lets OpenAI-style clients (for example the Conduit iOS app in Direct mode) use
+# the agent through /api/openai/v1 with a personal access token (PAT) that
+# carries the `runs:create` scope. Off by default.
+#
+# - `enabled` mounts the router once at startup, so changing it needs a Gateway
+#   restart. The other keys are read on every request.
+# - `modes` are offered as <model>:<mode> variants (for example `minimax:pro`).
+#   A model that offers only one mode is listed by its bare name.
+# - `default_mode` is the mode behind a bare model name. It must be one of
+#   `modes`, so narrow the two together.
+openai_compat:
+  enabled: false
+  default_mode: thinking # flash | thinking | pro | ultra
+  modes: [flash, thinking, pro, ultra]
 
 # ============================================================================
 # Skill Self-Evolution Configuration
