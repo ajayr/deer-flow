@@ -93,7 +93,7 @@ POLICY: tuple[ParamRule, ...] = (
     ParamRule("user", "ignored", "The access token is the identity."),
     ParamRule("metadata", "ignored", "The thread is the conversation; nothing is stored for the client."),
     ParamRule("store", "ignored", "The thread is the conversation; nothing is stored for the client."),
-    ParamRule("service_tier", "ignored", "Not applicable: the agent runs its own tools."),
+    ParamRule("service_tier", "ignored", "Not applicable: the operator's model configuration picks the provider and its tier."),
     ParamRule("parallel_tool_calls", "ignored", "Not applicable: the agent runs its own tools."),
     ParamRule("stream_options.*", "ignored", "Any `stream_options` key other than `include_usage`."),
     ParamRule("messages[].name", "ignored", "Ignored on every message."),
