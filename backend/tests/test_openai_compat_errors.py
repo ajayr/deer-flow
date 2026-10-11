@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import tracemalloc
 
 import pytest
 
@@ -100,6 +101,19 @@ def test_a_quoted_value_is_wrapped_in_single_quotes():
 def test_a_quoted_value_at_the_limit_is_kept_and_a_longer_one_is_cut():
     assert quote("x" * MAX_QUOTED_CHARS) == f"'{'x' * MAX_QUOTED_CHARS}'"
     assert quote("x" * (MAX_QUOTED_CHARS + 1)) == f"'{'x' * (MAX_QUOTED_CHARS - 3)}...'"
+
+
+def test_quoting_a_huge_value_reads_only_its_head():
+    value = "\x00" * 5_000_000
+    tracemalloc.start()
+    try:
+        quoted = quote(value)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert quoted == "'" + " " * (MAX_QUOTED_CHARS - 3) + "...'"
+    assert peak < 1_000_000
 
 
 def test_a_value_that_is_not_text_is_quoted_by_its_repr():
