@@ -286,3 +286,7 @@ the admitted group keeps its records on success or completes rollback on failure
 This is a store-local guarantee, not a change to RunJournal cancellation policy or
 JSONL's single-process deployment constraint. Regression coverage is in
 `tests/test_jsonl_event_store_cancellation.py`.
+
+## Messages-tuple text helpers
+
+`messages_stream.py` holds the shared readers for gateway `messages-tuple` stream events. `accumulate_stream_text` turns one event into the latest displayable text of the message it belongs to, and `is_assistant_stream_type` decides what counts as assistant output. That decision is an allowlist (the `ai` and `assistant` prefixes, never a substring test) because DeerFlow writes hidden model context (recalled memory, durable context, the rewritten echo of the user's turn) into the `messages` channel as human or system messages, and LangGraph fans every state write out on the stream. The IM channel manager uses these helpers; code that forwards streamed text to a client should call them instead of reading `payload["content"]` itself. The module uses only the standard library and, like every module here, never imports `app`. Regression coverage is `tests/test_runtime_messages_stream.py` plus the end-to-end cases in `tests/test_channels.py`.

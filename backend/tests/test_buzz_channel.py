@@ -2061,7 +2061,7 @@ def test_discovery_eose_without_a_pending_auth_send_does_not_fabricate_confirmat
 
 # -- FINDING 1 defense in depth: never publish DeerFlow's hidden model context -----
 #
-# The manager-side allowlist (`_accumulate_stream_text`) is the fix. This is the
+# The shared allowlist (`accumulate_stream_text`, used by the manager) is the fix. This is the
 # second layer, and it lives here rather than in a sibling connector because on
 # Buzz a leak is PERMANENT: every streaming update is an immutable public Nostr
 # event, so a corrective edit only changes what clients render -- the original
