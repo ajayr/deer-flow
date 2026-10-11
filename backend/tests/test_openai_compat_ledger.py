@@ -184,7 +184,7 @@ async def test_a_thread_with_a_conversation_hash_but_no_ledger_is_an_empty_candi
     assert (candidate.thread_id, candidate.turns) == ("t1", ())
 
 
-@pytest.mark.parametrize("ledger", ["oops", {"u": "x"}, 5, [{"u": "x", "a": None, "t": 1}, "broken"], [{"u": 7, "a": None, "t": 1}]])
+@pytest.mark.parametrize("ledger", ["oops", {"u": "x"}, 5, [{"u": "x", "a": None, "t": 1}, "broken"], [{"u": 7, "a": None, "t": 1}], [{"u": "x", "a": None, "t": 10**400}]])
 async def test_a_thread_whose_ledger_cannot_be_read_is_not_a_candidate(store, ledger):
     await _thread(store, "bad", conv=CONV, turns=ledger)
     await _thread(store, "good", conv=CONV, turns=[_turn("hello")])

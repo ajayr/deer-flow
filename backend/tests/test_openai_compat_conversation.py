@@ -135,6 +135,9 @@ def test_a_missing_answer_key_means_no_answer_yet():
         {"u": "x", "a": None, "t": None},
         {"u": "x", "a": None, "t": "1"},
         {"u": "x", "a": None, "t": True},
+        {"u": "x", "a": None, "t": 10**400},
+        {"u": "x", "a": None, "t": float("nan")},
+        {"u": "x", "a": None, "t": float("inf")},
     ],
 )
 def test_anything_that_is_not_a_well_formed_entry_is_not_a_turn(raw):
