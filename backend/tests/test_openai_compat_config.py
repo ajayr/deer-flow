@@ -30,7 +30,7 @@ def test_a_subset_of_modes_in_any_order_is_accepted():
 
 @pytest.mark.parametrize(
     "modes",
-    [[], ["turbo"], ["Flash"], ["flash", "flash"], "flash", None],
+    [[], ["flash", "turbo"], ["flash", "Pro"], ["flash", "flash"], "flash", None],
     ids=["empty", "unknown", "wrong-case", "duplicate", "not-a-list", "null"],
 )
 def test_invalid_modes_are_rejected(modes):

@@ -17,8 +17,8 @@ OPENAI_COMPAT_MODES: tuple[OpenAICompatMode, ...] = ("flash", "thinking", "pro",
 class OpenAICompatConfig(BaseModel):
     """OpenAI-compatible API settings.
 
-    The API lets OpenAI-style clients (for example Conduit's Direct mode) talk to
-    the agent with a personal access token. ``enabled`` is read once by
+    The API serves OpenAI-style clients (for example Conduit's Direct mode) that
+    authenticate with a personal access token. ``enabled`` is read once by
     ``create_app()``; ``default_mode`` and ``modes`` are read on every request.
     The order of ``modes`` does not matter: the model catalogue always lists
     modes in the canonical order of ``OPENAI_COMPAT_MODES``.

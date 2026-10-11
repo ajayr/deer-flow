@@ -589,8 +589,10 @@ listed: with `authorization.enabled`, role-based model authorization filters thi
 list exactly as it filters `GET /api/models`.
 
 Each model is listed by its bare name, which means the configured
-`openai_compat.default_mode`, followed by one `<model>:<mode>` variant for each
-mode it offers, for example `minimax`, `minimax:flash`, `minimax:thinking`,
+`openai_compat.default_mode` clamped to the model's reasoning contract (see
+[Configuration](CONFIGURATION.md#openai-compatible-api)), followed by one
+`<model>:<mode>` variant for each mode it offers, for example `minimax`,
+`minimax:flash`, `minimax:thinking`,
 `minimax:pro` and `minimax:ultra`. The modes are the web UI's: `flash` is fast
 without extended reasoning, `thinking` reasons before it acts, `pro` adds planning
 and `ultra` adds subagents. A model's reasoning contract limits them: a model
