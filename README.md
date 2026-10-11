@@ -79,6 +79,7 @@ DeerFlow has newly integrated the intelligent search and crawling toolset indepe
       - [Using Multiple Providers](#using-multiple-providers)
       - [Existing-Run Stream Actions](#existing-run-stream-actions)
       - [Personal Access Tokens](#personal-access-tokens)
+      - [OpenAI-compatible API](#openai-compatible-api)
   - [From Deep Research to Super Agent Harness](#from-deep-research-to-super-agent-harness)
   - [Core Features](#core-features)
     - [Skills \& Tools](#skills--tools)
@@ -1254,6 +1255,17 @@ other route answers `403` to PAT callers, and a PAT never carries admin
 capability. Tokens can be listed and revoked at any time; revocation is
 immediate. PATs require a database backend (SQLite/PostgreSQL). Full
 reference: [API Reference — Personal Access Tokens](backend/docs/API.md#personal-access-tokens).
+
+#### OpenAI-compatible API
+
+OpenAI-style clients, such as the Conduit iOS app in its Direct mode, can reach
+the agent through `/api/openai/v1` with a PAT that carries `runs:create`. The API
+is off by default: set `openai_compat.enabled: true` in `config.yaml` and restart
+the Gateway. `GET /api/openai/v1/models` lists every model the caller may use as
+`<model>` and as `<model>:<mode>` variants (`flash`, `thinking`, `pro`, `ultra`);
+`openai_compat.default_mode` and `openai_compat.modes` shape that list. Full
+reference: [API Reference — OpenAI-compatible API](backend/docs/API.md#openai-compatible-api)
+and [Configuration](backend/docs/CONFIGURATION.md#openai-compatible-api).
 
 ## From Deep Research to Super Agent Harness
 
