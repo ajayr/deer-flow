@@ -14,6 +14,7 @@ ties, because clients reformat assistant text and exact matching would fork a th
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -87,7 +88,11 @@ class Turn:
         u, a, t = raw.get("u"), raw.get("a"), raw.get("t")
         if not isinstance(u, str) or not (a is None or isinstance(a, str)) or isinstance(t, bool) or not isinstance(t, int | float):
             return None
-        return cls(u=u, a=a, t=float(t))
+        try:
+            start = float(t)
+        except OverflowError:  # an integer too large for a float
+            return None
+        return cls(u=u, a=a, t=start) if math.isfinite(start) else None
 
 
 def parse_turns(raw: object) -> tuple[Turn, ...] | None:
