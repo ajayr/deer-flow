@@ -13103,17 +13103,18 @@ class TestHandleGoalCommand:
 
 
 # ---------------------------------------------------------------------------
-# _merge_stream_text regression: CJK reduplication, repeated tokens, suffix
-# matching tails.  Proves that the fixed function does not drop legitimate
-# deltas that happen to match the accumulated buffer or its suffix.
-# Import is deferred because app.channels.manager pulls in fastapi.
+# merge_stream_text (deerflow.runtime.messages_stream) regression: CJK
+# reduplication, repeated tokens, suffix matching tails.  Proves that the fixed
+# function does not drop legitimate deltas that happen to match the accumulated
+# buffer or its suffix.  The channel manager consumes it; the leaf helpers are
+# also tested directly in tests/test_runtime_messages_stream.py.
 # ---------------------------------------------------------------------------
 
 
 def _get_merge_stream_text():
-    from app.channels.manager import _merge_stream_text
+    from deerflow.runtime.messages_stream import merge_stream_text
 
-    return _merge_stream_text
+    return merge_stream_text
 
 
 def test_merge_stream_text_cjk_reduplication():
@@ -13162,7 +13163,7 @@ def test_merge_stream_text_normal_append():
 
 
 # ---------------------------------------------------------------------------
-# LIVE-TEST FINDING 1 (critical, data disclosure): _accumulate_stream_text
+# LIVE-TEST FINDING 1 (critical, data disclosure): accumulate_stream_text
 # decided what streamed payloads become displayable assistant text by REJECTING
 # only payloads whose ``type`` contained "tool".  DeerFlow injects hidden
 # context -- memory facts (DynamicContextMiddleware) and durable context
@@ -13182,9 +13183,9 @@ def test_merge_stream_text_normal_append():
 
 
 def _get_accumulate_stream_text():
-    from app.channels.manager import _accumulate_stream_text
+    from deerflow.runtime.messages_stream import accumulate_stream_text
 
-    return _accumulate_stream_text
+    return accumulate_stream_text
 
 
 _MEMORY_LEAK_TEXT = "<memory>\nFacts:\n- [context | 0.70] User interacts with the assistant through the DeerFlow chat channel.\n</memory>"
@@ -13364,6 +13365,16 @@ def test_accumulate_stream_text_hidden_context_between_assistant_chunks_never_en
     text, _ = _accumulate(buffers, current_after, [{"id": "ai-1", "content": "succeeded.", "type": "AIMessageChunk"}, {}])
     assert text == "Deploy succeeded."
     assert buffers == {"ai-1": "Deploy succeeded."}
+
+
+def test_channel_manager_shares_the_runtime_stream_helpers():
+    """The manager must use the shared rule for displayable assistant text, not a private copy of it."""
+    from app.channels import manager
+    from deerflow.runtime import messages_stream
+
+    assert manager.accumulate_stream_text is messages_stream.accumulate_stream_text
+    for name in ("extract_text_content", "merge_stream_text", "extract_stream_message_id", "stream_payload_type", "is_assistant_stream_type", "accumulate_stream_text"):
+        assert not hasattr(manager, f"_{name}"), f"app.channels.manager still defines a private _{name}"
 
 
 def test_streaming_chat_never_publishes_hidden_memory_context(monkeypatch):

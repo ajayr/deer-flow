@@ -373,6 +373,6 @@ assert "messages" in agent.stream.call_args.kwargs["stream_mode"]
 | 序列化到 wire 格式 | `packages/harness/deerflow/runtime/serialization.py` |
 | LangGraph mode 命名翻译 | `packages/harness/deerflow/runtime/stream_modes.py::to_langgraph_stream_modes`（调用点 `packages/harness/deerflow/runtime/runs/worker.py::run_agent`） |
 | 飞书渠道的增量卡片更新 | `app/channels/manager.py::_handle_streaming_chat` |
-| Channels 自带的 delta/cumulative 防御性累加 | `app/channels/manager.py::_merge_stream_text` |
+| 共享的 delta/cumulative 防御性累加（Channels 使用） | `packages/harness/deerflow/runtime/messages_stream.py::merge_stream_text` |
 | Frontend useStream 支持的 mode 集合 | `frontend/src/core/api/stream-mode.ts` |
 | 核心回归测试 | `backend/tests/test_client.py::TestStream::test_messages_mode_emits_token_deltas` |

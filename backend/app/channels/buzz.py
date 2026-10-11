@@ -1418,7 +1418,7 @@ class BuzzChannel(Channel):
 
         DEFENSE IN DEPTH: text carrying one of DeerFlow's hidden model-context
         wrappers is refused outright. The real fix is one layer up
-        (``manager._accumulate_stream_text`` now allowlists assistant message
+        (``messages_stream.accumulate_stream_text`` now allowlists assistant message
         types instead of denylisting tool ones), but this connector is the one
         where a leak cannot be taken back: every streaming update is an immutable
         public Nostr event, so a corrective edit only changes what clients render
