@@ -1,8 +1,8 @@
 # OpenAI-compatible API
 
-`routers/openai_compat.py` serves `/api/openai/v1` for OpenAI-style clients such as the Conduit iOS app in Direct mode. `create_app()` mounts it once at startup, and only when `openai_compat.enabled` is true (a startup-only field in `reload_boundary.py`); with the flag off the routes are not registered and are absent from OpenAPI. `default_mode` and `modes` are read on every request.
+`routers/openai_compat.py` serves `/api/openai/v1` for OpenAI-style clients such as the Conduit iOS app in Direct mode. `create_app()` mounts it once at startup, and only when `openai_compat.enabled` is true (a startup-only field in `reload_boundary.py`); with the flag off the routes are not registered and are absent from OpenAPI. Every key except `enabled` is read on every request.
 
-Every route carries `@require_permission("runs", "create")` and has its own entry in `auth/pat.py::_PAT_ROUTE_RULES`, so an ordinary PAT with `runs:create` is the credential. The PAT test derives its expectation from the router: a route added here fails `test_pat_openai_compat_policy_admits_exactly_the_mounted_routes` until it is allowlisted. The `/api/openai/` nginx location (in all three configs) carries the large-body, unspooled-request settings that a conversation resent on every request needs; `tests/test_nginx_openai_compat_route.py` pins them.
+Every route carries `@require_permission("runs", "create")` and has its own entry in `auth/pat.py::_PAT_ROUTE_RULES`. `GET /models` needs only that scope; `POST /chat/completions` stacks `runs:read`, `threads:read` and `threads:write` on it, because it creates and reads threads, so its PAT needs all four. The PAT test derives its expectation from the router: a route added here fails `test_pat_openai_compat_policy_admits_exactly_the_mounted_routes` until it is allowlisted. The `/api/openai/` nginx location (in all three configs) carries the large-body, unspooled-request settings that a conversation resent on every request needs; `tests/test_nginx_openai_compat_route.py` pins them.
 
 This package is plain Python: it imports neither FastAPI nor Starlette, and the router is the only module that does, so the logic tests without an app. `schemas.py` holds the response models.
 
@@ -31,4 +31,12 @@ This package is plain Python: it imports neither FastAPI nor Starlette, and the 
 - The streamed `content` should equal `stored_answer()` of the thread's messages, because clients resend it as history. Middleware that rewrites a message after it streamed breaks that, so the router must pass the stored answer to `finish(stored=...)`.
 - `tests/fixtures/openai_compat/streams/` holds hermetic recordings (a scripted model, not the live stack). After a library upgrade, regenerate them with `DEERFLOW_WRITE_FIXTURES=1` and review the diff.
 
-Config lives in `deerflow/config/openai_compat_config.py`. A new key needs `config.example.yaml`, `docs/CONFIGURATION.md` and `tests/test_openai_compat_docs.py` updated together.
+`driver.py` runs one response: it reads the run's bridge subscription, feeds the translator and sends a keepalive comment after 5 seconds of silence. It is plain asyncio, tested on a virtual-clock loop. `completion.py` builds the non-streaming body and maps an in-band failure to its HTTP status. The router owns the response lifecycle (`_frames`, `_answer`, `_finish`). Keep these rules:
+
+- Start the run with `multitask_strategy="reject"`: a run in flight in the thread is a 409 `conversation_busy`. Append the ledger turn only after `start_run` succeeds, and record the answer before `[DONE]`, so a refused request leaves the ledger as it was and an immediate next message continues the thread.
+- A failure frame (the run's `error` event, or the model's error message) is held until the run's `end`, at most `FAILED_RUN_WAIT_SECONDS`. Only `end` means the thread is idle again; reporting sooner gives a retry a spurious 409.
+- Cancel a run only when the client left a run that is still going, under `on_disconnect: cancel`. A stream that fails or is lost never cancels it.
+- `Request.is_disconnected()` never fires behind the Gateway's `BaseHTTPMiddleware` layers, so `_Hangup` waits on the ASGI receive channel instead.
+- The log line has ids, the model, the ignored parameter names and the outcome, never message text.
+
+Config lives in `deerflow/config/openai_compat_config.py`. A new key needs `config.example.yaml` (with a `config_version` bump, mirrored in the Helm chart: `scripts/check_config_version.sh`), `docs/CONFIGURATION.md` and `tests/test_openai_compat_docs.py` updated together.
