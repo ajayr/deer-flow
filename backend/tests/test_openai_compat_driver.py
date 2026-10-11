@@ -752,6 +752,29 @@ def test_a_consumer_that_closes_the_generator_leaves_the_ending_open_and_the_rea
     assert run.probe.cancelled
 
 
+FALLBACK_FRAME = StreamEvent(id="2", event="messages", data=[{**ai("The model provider failed.").data[0], "additional_kwargs": {"deerflow_error_fallback": True}}, {"langgraph_node": "model"}])
+
+
+@pytest.mark.parametrize("frame", [ERROR_FRAME, FALLBACK_FRAME], ids=["error event", "error message of the model"])
+def test_a_consumer_that_closes_the_generator_while_a_failed_run_ends_leaves_a_failed_ending(frame):
+    async def scenario():
+        run = Scenario(frame, 60, END_SENTINEL)
+        steps = run.stream.steps()
+        await anext(steps)
+        reader = asyncio.ensure_future(anext(steps))
+        await asyncio.sleep(1)
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+        await asyncio.sleep(0)
+        return run
+
+    run = play(scenario())
+
+    # The router cancels a run only for a response that ended open; this one had already failed.
+    assert run.stream.ended == "failed" and run.stream.failure is RUN_ERROR
+
+
 def test_closing_the_generator_between_steps_cancels_nothing_that_is_not_there():
     async def scenario():
         run = Scenario(ai("Hello", position="last"), END_SENTINEL)

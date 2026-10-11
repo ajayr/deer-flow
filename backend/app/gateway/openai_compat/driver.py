@@ -208,6 +208,8 @@ class RunStream:
         # A heartbeat of the bridge is a frame the translator has nothing to say about.
         outputs = self._translator.feed(item.event, item.data, now=now)
         if self._translator.closed:
+            # Known before the wait: a client that leaves while the run ends left a failed response, not a running one.
+            self._mark_ended(outputs)
             await self._wait_for_end()
         return outputs
 
