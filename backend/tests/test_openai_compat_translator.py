@@ -848,6 +848,34 @@ def test_next_deadline_is_the_earlier_of_the_hold_and_the_silence_notice():
     assert late.translator.next_deadline() == SILENCE_NOTICE_SECONDS
 
 
+def test_a_tick_at_next_deadline_releases_held_text_on_a_clock_that_is_not_exact_in_binary():
+    run = Run()
+    run.send(ai("Hello"), at=0.4)
+
+    assert run.translator.next_deadline() == 1.4
+    assert shape(run.tick(at=run.translator.next_deadline())) == [("content", "Hello")]
+
+
+def test_a_tick_at_next_deadline_sends_the_still_working_notice_on_a_clock_that_is_not_exact_in_binary():
+    translator = StreamTranslator(completion_id="c", model="m", created=1)
+    translator.open(now=8.2)
+
+    assert shape(translator.tick(now=translator.next_deadline())) == [("reasoning", "Still working... (2 min)\n")]
+
+
+def test_a_tick_at_next_deadline_always_has_something_to_do():
+    for tenths in range(3000):
+        start = tenths / 10
+        held = StreamTranslator(completion_id="c", model="m", created=1)
+        held.open(now=start)
+        held.feed("messages", ai("Hello"), now=start + 0.2)
+        silent = StreamTranslator(completion_id="c", model="m", created=1)
+        silent.open(now=start)
+
+        assert shape(held.tick(now=held.next_deadline())) == [("content", "Hello")], start
+        assert shape(silent.tick(now=silent.next_deadline())) == [("reasoning", "Still working... (2 min)\n")], start
+
+
 # ── wire format ──────────────────────────────────────────────────────────────
 
 
