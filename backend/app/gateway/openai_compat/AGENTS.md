@@ -9,13 +9,19 @@ This package is plain Python: it imports neither FastAPI nor Starlette, and the 
 `modes.py` builds the ids a caller can send as `model`: the bare name (`default_mode`, clamped to the model's reasoning contract) and one `<model>:<mode>` variant per mode that the contract allows and `modes` lists, in the order flash, thinking, pro, ultra. Keep these rules:
 
 - Build the catalogue from `list_models()` output, never from `config.models`. That keeps model authorization and its fail-closed handling, and a model hidden from the caller can neither leak its name nor take a variant id from a visible model.
-- A name equal to a model the caller can use always means that model, so a colliding variant id is skipped. Resolve a requested `model` the same way: it must equal an id that `GET /models` lists for the caller, compared exactly (no case folding, no trimming, no splitting at a colon).
+- A name equal to a model the caller can use always means that model, so a colliding variant id is skipped. Resolve a requested `model` the same way (`resolve_model`): it must equal an id that `GET /models` lists for the caller, compared exactly (no case folding, no trimming, no splitting at a colon), so `<name>:<mode>` for a model that offers a single mode is a 404.
 - A model that offers no mode is not listed; one that offers a single mode is listed by its bare name only.
 - Every entry advertises `ADVERTISED_CONTEXT_LENGTH` and `is_multimodal: false`. Conduit falls back to a 4096-token window when the length is missing and then trims the history it resends, and it treats a missing flag as multimodal. Do not substitute a model's real window.
 
+`params.py` and `messages.py` decide what a request may contain, and `errors.py` builds the error envelope. `POLICY` in `params.py` is the only list of the parameters that are honored, ignored (reported in `X-DeerFlow-Ignored-Params`) or rejected with a 400. Keep these rules:
+
+- Never drop a field silently: honor it, ignore and report it, or reject it with a 400 that says why. A new OpenAI field starts as ignored. `null` counts as absent.
+- A message keeps only its role and text. The history starts and ends with a user message, and every user message needs text.
+- Error messages stay under 400 characters (Conduit cuts at 512), quote at most 40 characters of the request and carry nothing from an exception.
+
 `translator.py` is the only place that decides what a client sees of a run. It is pure (no I/O, no clock, no FastAPI): the router passes it each stream frame and the current monotonic time. Its docstrings hold the routing rules; `errors.py` holds the fixed in-band error messages, which carry nothing from the failure. Keep these invariants:
 
-- Never forward tool arguments or outputs, human or system messages (hidden memory rides that channel), AI messages from the `tools` node, or frames from nested graphs. Never emit `tool_calls`: Conduit turns it into an error.
+- Never forward tool arguments or outputs (the one exception, the question of an `ask_clarification` call or a sandbox network approval request, ends the answer), human or system messages (hidden memory rides that channel), AI messages from the `tools` node, or frames from nested graphs. Never emit `tool_calls`: Conduit turns it into an error.
 - A stream ends with `[DONE]` or with one in-band error, never both.
 - The streamed `content` should equal `stored_answer()` of the thread's messages, because clients resend it as history. Middleware that rewrites a message after it streamed breaks that, so the router must pass the stored answer to `finish(stored=...)`.
 - `tests/fixtures/openai_compat/streams/` holds hermetic recordings (a scripted model, not the live stack). After a library upgrade, regenerate them with `DEERFLOW_WRITE_FIXTURES=1` and review the diff.
