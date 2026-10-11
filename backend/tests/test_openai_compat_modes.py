@@ -199,6 +199,13 @@ def test_a_repeated_model_name_keeps_its_first_entry():
     assert "alpha:pro" in ids
 
 
+def test_a_repeated_model_name_whose_first_entry_offers_no_mode_is_not_listed():
+    """The name resolves to its first entry, so a later entry must not advertise modes the first cannot serve."""
+    entries = _catalogue([_model("x", "unsupported"), _model("x")], modes=["thinking", "pro"], default_mode="thinking")
+
+    assert entries == []
+
+
 def test_ids_are_unique_whatever_the_model_names():
     models = [_model("a"), _model("a:flash"), _model("a:flash:pro"), _model("b", "required"), _model("b:pro"), _model("a")]
     ids = _ids(_catalogue(models))
