@@ -4,7 +4,7 @@ Pure: no FastAPI, no I/O. The router keeps only the role and the text of each me
 than ``user`` and ``assistant``, content other than text, and every field that would make the
 agent behave differently (tool calls, audio) are refused with a 400 that says why, so a client
 never believes it sent something the agent did not receive. Fields that do not change the answer
-(``name``, the reasoning an earlier reply carried) are accepted, ignored and reported.
+(``name``, the reasoning an earlier reply carried, the other keys of a text part such as ``cache_control``) are accepted, ignored and reported.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ Role = Literal["user", "assistant"]
 
 _ROLES: tuple[Role, ...] = ("user", "assistant")
 _KEPT_KEYS = frozenset({"role", "content"})
+_KEPT_PART_KEYS = frozenset({"type", "text"})
 
 _SYSTEM_PROMPT_HINT = "Clear the system prompt in your client; DeerFlow uses its own."
 _NO_TOOLS_HINT = "DeerFlow runs its own tools on the server."
@@ -48,11 +49,11 @@ class ParsedMessages:
     """The history and the message-level fields that were accepted and ignored."""
 
     messages: tuple[ChatMessage, ...]
-    #: Names such as ``messages[].name``, each once, in order of first appearance.
+    #: Names such as ``messages[].name`` and ``messages[].content[].cache_control``, each once, in order of first appearance.
     ignored: tuple[str, ...]
 
 
-def _text_of(content: Any, param: str) -> str:
+def _text_of(content: Any, param: str, ignored: dict[str, None]) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -73,6 +74,9 @@ def _text_of(content: Any, param: str) -> str:
         if not isinstance(text, str):
             raise invalid_message("A text part needs a string 'text'.", param=f"{part_param}.text")
         texts.append(text)
+        for key, value in part.items():
+            if value is not None and key not in _KEPT_PART_KEYS:
+                ignored[f"messages[].content[].{safe_name(key)}"] = None
     return "\n".join(texts)
 
 
@@ -111,7 +115,7 @@ def parse_messages(raw: Any) -> ParsedMessages:
         for key, value in item.items():
             if value is not None and key not in _KEPT_KEYS and key not in MESSAGE_REJECTED:
                 ignored[f"messages[].{safe_name(key)}"] = None
-        text = _text_of(item.get("content"), param)
+        text = _text_of(item.get("content"), param, ignored)
         if _UNPAIRED_SURROGATE.search(text):
             raise invalid_message("Message text is not valid Unicode: it holds an unpaired surrogate. Remove the broken character and retry.", param=f"{param}.content")
         if role == "user" and not text.split():

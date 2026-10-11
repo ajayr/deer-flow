@@ -254,3 +254,37 @@ def test_an_unknown_message_key_is_ignored_and_reported_without_its_value():
 
 def test_a_null_valued_key_is_not_reported():
     assert parse_messages([_user("one", name=None, extra=None)]).ignored == ()
+
+
+def test_other_keys_of_a_text_part_are_ignored_and_reported_once():
+    cached = {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+    raw = [
+        _user([cached, {"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}, "citations": []}]),
+        _assistant([{"type": "text", "text": "two", "annotations": []}]),
+        _user([cached]),
+    ]
+
+    parsed = parse_messages(raw)
+
+    assert parsed.ignored == ("messages[].content[].cache_control", "messages[].content[].citations", "messages[].content[].annotations")
+    assert [message.text for message in parsed.messages] == ["hello\nagain", "two", "hello"]
+
+
+def test_the_keys_of_a_message_are_reported_before_the_keys_of_its_parts():
+    parsed = parse_messages([_user([{"type": "text", "text": "hi", "cache_control": {}}], name="alice")])
+
+    assert parsed.ignored == ("messages[].name", "messages[].content[].cache_control")
+
+
+def test_a_key_of_a_part_is_reported_without_its_value_and_made_safe_for_a_header():
+    parsed = parse_messages([_user([{"type": "text", "text": "hi", "odd key\r\n": "a secret value"}])])
+
+    assert parsed.ignored == ("messages[].content[].odd_key__",)
+
+
+def test_a_null_valued_key_of_a_part_is_not_reported():
+    assert parse_messages([_user([{"type": "text", "text": "hi", "cache_control": None}])]).ignored == ()
+
+
+def test_the_type_and_the_text_of_a_part_are_not_reported():
+    assert parse_messages([_user([{"type": "text", "text": "hi"}])]).ignored == ()

@@ -101,7 +101,7 @@ def test_the_policy_names_exactly_the_parameters_the_spec_lists():
     by_tier = {tier: {rule.name for rule in POLICY if rule.tier == tier} for tier in ("honored", "ignored", "rejected")}
 
     assert by_tier["honored"] == HONORED
-    assert by_tier["ignored"] == IGNORED | {"stream_options.*", "*"} | {f"messages[].{key}" for key in MESSAGE_IGNORED}
+    assert by_tier["ignored"] == IGNORED | {"stream_options.*", "*", "messages[].content[].*"} | {f"messages[].{key}" for key in MESSAGE_IGNORED}
     assert by_tier["rejected"] == REJECTED | {f"messages[].{key}" for key in MESSAGE_REFUSED}
 
 

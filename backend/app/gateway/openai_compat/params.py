@@ -102,6 +102,7 @@ POLICY: tuple[ParamRule, ...] = (
     ParamRule("messages[].reasoning_details", "ignored", _ECHO),
     ParamRule("messages[].refusal", "ignored", _ECHO),
     ParamRule("messages[].annotations", "ignored", _ECHO),
+    ParamRule("messages[].content[].*", "ignored", "Any key of a text part other than `type` and `text`, such as `cache_control`."),
     ParamRule("*", "ignored", "Any other field, at the top level or on a message."),
     # -- rejected: answering anyway would mislead ------------------------------------------------
     ParamRule("tools", "rejected", "Only an empty list is accepted.", _empty_list, hint=_NO_TOOLS_HINT),
