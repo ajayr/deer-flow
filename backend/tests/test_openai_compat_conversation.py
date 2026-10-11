@@ -8,6 +8,7 @@ from app.gateway.openai_compat.conversation import (
     Candidate,
     Exchange,
     Match,
+    ThreadPlan,
     Turn,
     best_match,
     check_ingest,
@@ -15,6 +16,7 @@ from app.gateway.openai_compat.conversation import (
     imported_turns,
     norm,
     parse_turns,
+    plan_thread,
     seed_messages,
     seed_title,
     text_hash,
@@ -425,3 +427,110 @@ def test_the_ellipsis_never_follows_a_space():
     # The cut falls right after a space, in the fifty-character cut and in the shorter one that leaves room for the ellipsis.
     assert seed_title("a" * 49 + " " + "b" * 40, max_chars=60) == "a" * 49 + "..."
     assert seed_title("abcdef " + "b" * 40, max_chars=10) == "abcdef..."
+
+
+# ── plan_thread ──────────────────────────────────────────────────────────────
+
+CAPS = {"max_messages": 400, "max_chars": 500_000}
+
+
+def test_a_history_that_adds_one_message_to_a_stored_conversation_runs_in_that_thread():
+    stored = _candidate("t-1", _turn("one", "two"), _turn("three", "four"))
+
+    plan = plan_thread(_history(("one", "two"), ("three", "four"), ("five", None)), [stored], **CAPS)
+
+    assert plan == ThreadPlan(thread_id="t-1", message="five", seed=())
+
+
+def test_a_first_message_starts_a_new_thread_with_nothing_to_seed():
+    assert plan_thread(_history(("hello", None)), [], **CAPS) == ThreadPlan(thread_id=None, message="hello", seed=())
+
+
+def test_a_first_message_never_continues_a_thread_whose_ledger_is_empty():
+    assert plan_thread(_history(("hello", None)), [_candidate("t-1")], **CAPS).thread_id is None
+
+
+def test_a_history_no_stored_thread_holds_starts_a_new_thread_seeded_with_everything_before_the_new_message():
+    history = _history(("one", "two"), ("three", None), ("four", None))
+
+    plan = plan_thread(history, [], **CAPS)
+
+    assert plan == ThreadPlan(thread_id=None, message="four", seed=(Exchange("one", "two"), Exchange("three", None)))
+
+
+def test_the_new_message_is_kept_exactly_as_the_client_sent_it():
+    stored = _candidate("t-1", _turn("one", "two"))
+
+    assert plan_thread(_history(("one", "two"), ("  five \n six ", None)), [stored], **CAPS).message == "  five \n six "
+    assert plan_thread(_history(("one", "two"), ("  five \n six ", None)), [], **CAPS).message == "  five \n six "
+
+
+def test_a_history_that_repeats_the_last_message_of_a_stored_conversation_starts_a_new_thread():
+    stored = _candidate("t-1", _turn("one", "two"), _turn("three", "four"))
+
+    plan = plan_thread(_history(("one", "two"), ("three", None)), [stored], **CAPS)
+
+    assert plan == ThreadPlan(thread_id=None, message="three", seed=(Exchange("one", "two"),))
+
+
+def test_a_history_that_edits_an_earlier_user_message_starts_a_new_thread():
+    stored = _candidate("t-1", _turn("one", "two"), _turn("three", "four"))
+
+    plan = plan_thread(_history(("one", "two"), ("changed", "four"), ("five", None)), [stored], **CAPS)
+
+    assert plan.thread_id is None
+    assert plan.seed == (Exchange("one", "two"), Exchange("changed", "four"))
+
+
+def test_a_history_that_adds_more_than_one_message_to_a_stored_conversation_starts_a_new_thread():
+    stored = _candidate("t-1", _turn("one", "two"))
+
+    plan = plan_thread(_history(("one", "two"), ("three", "four"), ("five", None)), [stored], **CAPS)
+
+    assert plan.thread_id is None
+    assert plan.seed == (Exchange("one", "two"), Exchange("three", "four"))
+
+
+def test_the_thread_that_matches_the_most_decides_not_any_thread_the_history_would_continue():
+    # t-2 is a second answer to "three"; the history asks "three" again after t-1's conversation, so it is that, not a continuation of t-1.
+    shorter = _candidate("t-1", _turn("one", "two"), _turn("three", "four"))
+    longer = _candidate("t-2", _turn("one", "two"), _turn("three", "four"), _turn("five", "six"))
+
+    assert plan_thread(_history(("one", "two"), ("three", "four"), ("five", None)), [shorter, longer], **CAPS).thread_id is None
+    assert plan_thread(_history(("one", "two"), ("three", "four"), ("five", "six"), ("seven", None)), [shorter, longer], **CAPS).thread_id == "t-2"
+
+
+def test_a_continuing_conversation_ingests_only_its_new_message():
+    turns = [_turn(f"question {n}", f"answer {n}") for n in range(50)]
+    history = _history(*[(f"question {n}", f"answer {n}") for n in range(50)], ("one more", None))
+
+    plan = plan_thread(history, [_candidate("t-1", *turns)], max_messages=1, max_chars=1)
+
+    assert plan.thread_id == "t-1"
+    assert plan.seed == ()
+
+
+def test_seeding_counts_every_message_it_would_write_the_new_one_included():
+    history = _history(("one", "two"), ("three", None), ("four", None))  # one, two, three, four
+
+    assert plan_thread(history, [], max_messages=4, max_chars=500_000).thread_id is None
+    with pytest.raises(OpenAIError) as error:
+        plan_thread(history, [], max_messages=3, max_chars=500_000)
+    assert (error.value.status_code, error.value.code, error.value.param) == (400, "context_length_exceeded", "messages")
+
+
+def test_seeding_counts_every_character_it_would_write_the_new_message_included():
+    history = _history(("one", "two"), ("three", None), ("four", None))  # 3 + 3 + 5 + 4 characters
+
+    assert plan_thread(history, [], max_messages=400, max_chars=15).thread_id is None
+    with pytest.raises(OpenAIError) as error:
+        plan_thread(history, [], max_messages=400, max_chars=14)
+    assert error.value.code == "context_length_exceeded"
+
+
+def test_a_history_that_is_too_large_to_seed_is_refused_even_when_a_stored_thread_shares_its_start():
+    stored = _candidate("t-1", _turn("one", "two"), _turn("three", "four"))
+    history = _history(("one", "two"), ("changed", "four"), ("five", None))
+
+    with pytest.raises(OpenAIError):
+        plan_thread(history, [stored], max_messages=2, max_chars=500_000)
