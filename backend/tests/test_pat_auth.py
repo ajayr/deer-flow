@@ -675,6 +675,8 @@ def test_pat_openai_compat_policy_admits_exactly_the_mounted_routes():
         ("GET", "/api/openai/v1"),
         ("GET", "/api/openai/models"),
         ("GET", "/api/openai/v2/models"),
+        ("GET", "/api/openai/v1/embeddings"),
+        ("POST", "/api/openai/v1/completions"),
     ]:
         assert not is_pat_allowed_route(method, path), f"{method} {path} is not implemented and must stay denied"
 

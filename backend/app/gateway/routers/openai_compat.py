@@ -30,7 +30,7 @@ _STARTED_AT = int(time.time())
     response_model=ModelList,
     response_model_exclude_none=True,
     summary="List Models (OpenAI-compatible)",
-    description="List the ids an OpenAI-style client can send as `model`: each model the caller may use, as `<model>` and as one `<model>:<mode>` variant per offered mode.",
+    description="List the ids an OpenAI-style client can send as `model`: each model the caller may use that offers a mode, as `<model>`, plus one `<model>:<mode>` variant per offered mode when it offers more than one.",
 )
 @require_permission("runs", "create")
 async def list_openai_models(request: Request, config: AppConfig = Depends(get_config)) -> ModelList:
@@ -39,9 +39,11 @@ async def list_openai_models(request: Request, config: AppConfig = Depends(get_c
     The models come from the Gateway's own model listing, so role-based model
     authorization and its fail-closed / fail-open handling apply here exactly as
     they do for the web UI. Each model is listed by its bare name, which means
-    ``openai_compat.default_mode``, and as one ``<model>:<mode>`` variant for
-    each mode in ``openai_compat.modes`` that its reasoning contract allows. A
-    model that allows only one mode is listed by its bare name alone.
+    ``openai_compat.default_mode`` clamped to the model's reasoning contract
+    (or its first offered mode when the clamped one is not offered), and as one
+    ``<model>:<mode>`` variant for each mode in ``openai_compat.modes`` that its
+    reasoning contract allows. A model that offers only one mode is listed by
+    its bare name alone, and a model that offers no mode is not listed.
 
     Every entry advertises the same large ``context_length`` and
     ``is_multimodal: false``: clients such as Conduit fall back to a 4096-token

@@ -1274,8 +1274,10 @@ Content-Type: application/json
 
 Each token runs with its owning user's identity (owner filtering and per-user
 memory keep working), carries a scope set that can only narrow that user's
-permissions, and is admitted only to the thread/run lifecycle routes — every
-other route answers `403` to PAT callers, and a PAT never carries admin
+permissions, and is admitted only to the thread/run lifecycle routes and, while
+the [OpenAI-compatible API](#openai-compatible-api) is enabled, to its
+`/api/openai/v1` routes — every other route answers `403` to PAT callers, and a
+PAT never carries admin
 capability. Tokens can be listed and revoked at any time; revocation is
 immediate. PATs require a database backend (SQLite/PostgreSQL). Full
 reference: [API Reference — Personal Access Tokens](backend/docs/API.md#personal-access-tokens).
