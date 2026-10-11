@@ -1622,6 +1622,28 @@ title:
   model_name: null  # null = fast local fallback; set a model name to use LLM title generation
 ```
 
+### OpenAI-compatible API
+
+The Gateway can serve an OpenAI-style API at `/api/openai/v1`, so a client such as
+the Conduit iOS app (in its Direct mode) can use the agent. It is off by default:
+
+```yaml
+openai_compat:
+  enabled: false
+  default_mode: thinking # flash | thinking | pro | ultra
+  modes: [flash, thinking, pro, ultra]
+```
+
+Notes:
+
+- `enabled` mounts the routes once at startup, so changing it needs a Gateway restart. While it is `false` the routes are not registered and do not appear in the OpenAPI schema.
+- Clients authenticate with a [personal access token](API.md#personal-access-tokens) that carries the `runs:create` scope.
+- Every model a caller may use is offered as `<model>` and as `<model>:<mode>` variants (for example `minimax:pro`). The modes are the web UI's: `flash` is fast without extended reasoning, `thinking` reasons before it acts, `pro` adds planning and `ultra` adds subagents. A model's reasoning contract limits them: a model without thinking offers only `flash`, a model that always thinks never offers `flash`, and a model left with a single mode is listed by its bare name alone.
+- `default_mode` is the mode behind a bare model name. It is clamped to the model's reasoning contract; when the clamped mode is not in `modes`, the model's first offered mode is used. `default_mode` must be one of `modes`, so narrow the two together: `modes: [flash]` alone fails validation because `default_mode` is still `thinking`.
+- `modes` is a non-empty list without duplicates, drawn from `flash`, `thinking`, `pro` and `ultra`. Its order does not matter: the model list always uses the order above.
+- `default_mode` and `modes` are read on every request, so edits apply without a restart.
+- See [API Reference](API.md#openai-compatible-api) for the routes.
+
 ### GitHub API Token (Optional for GitHub Deep Research Skill)
 
 The default GitHub API rate limits are quite restrictive. For frequent project research, we recommend configuring a personal access token (PAT) with read-only permissions.

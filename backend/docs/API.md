@@ -146,8 +146,10 @@ Revocation is immediate.
   `GET /api/threads/{thread_id}/runs/{run_id}` plus its `cancel` (POST),
   `join`/`messages`/`events`/`workspace-changes` (GET), and
   `GET|POST .../runs/{run_id}/stream`), plus `POST /api/runs/stream|wait` and
-  `GET /api/runs/{run_id}/messages|feedback`. A route added under `/runs` is
-  denied until explicitly added to the policy.
+  `GET /api/runs/{run_id}/messages|feedback`, and, when `openai_compat.enabled`
+  is true, `GET /api/openai/v1/models` (see
+  [OpenAI-compatible API](#openai-compatible-api)). A route added under `/runs`
+  is denied until explicitly added to the policy.
   Every other authenticated route — memory, agents, models, MCP/skills
   config, integrations, channels, uploads — answers `403` to PAT callers
   regardless of scopes. Scope enforcement alone only constrains
@@ -573,6 +575,83 @@ via `config.configurable.thread_id` to keep conversation history.
   "stream_mode": ["values", "messages-tuple", "custom"]
 }
 ```
+
+---
+
+## OpenAI-compatible API
+
+Base URL: `/api/openai/v1`
+
+An OpenAI-style API for clients that speak the OpenAI protocol, such as the
+Conduit iOS app in its Direct mode.
+
+### Enabling and credentials
+
+The API is off by default. Set `openai_compat.enabled: true` in `config.yaml` and
+restart the Gateway (see [Configuration](CONFIGURATION.md#openai-compatible-api)).
+While it is off the routes do not exist and are not part of the OpenAPI schema.
+
+Authenticate with a [personal access token](#personal-access-tokens) that carries
+the `runs:create` scope, sent as `Authorization: Bearer dfp_...`; a browser
+session works too. A token without `runs:create` gets `403` with
+`Permission denied: runs:create`, and a missing or invalid credential gets `401`.
+Errors use the Gateway's usual `{"detail": ...}` body.
+
+### List Models (OpenAI-style)
+
+```http
+GET /api/openai/v1/models
+```
+
+Lists the ids the caller can send as `model`, in the OpenAI `GET /models` shape
+plus the fields Open WebUI-style clients read. Only models the caller may use are
+listed: with `authorization.enabled`, role-based model authorization filters this
+list exactly as it filters `GET /api/models`.
+
+Each model is listed by its bare name, which means the configured
+`openai_compat.default_mode`, followed by one `<model>:<mode>` variant for each
+mode it offers, for example `minimax`, `minimax:flash`, `minimax:thinking`,
+`minimax:pro` and `minimax:ultra`. The modes are the web UI's: `flash` is fast
+without extended reasoning, `thinking` reasons before it acts, `pro` adds planning
+and `ultra` adds subagents. A model's reasoning contract limits them: a model
+without thinking offers only `flash`, a model that always thinks never offers
+`flash`, and a model left with a single mode is listed by its bare name alone.
+`openai_compat.modes` narrows the offer for every model.
+
+**Response:**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "minimax",
+      "object": "model",
+      "created": 1760100000,
+      "owned_by": "deerflow",
+      "name": "MiniMax M3",
+      "description": "MiniMax M3 via Ollama Cloud",
+      "is_multimodal": false,
+      "context_length": 1048576
+    },
+    {
+      "id": "minimax:pro",
+      "object": "model",
+      "created": 1760100000,
+      "owned_by": "deerflow",
+      "name": "MiniMax M3 (pro)",
+      "description": "MiniMax M3 via Ollama Cloud",
+      "is_multimodal": false,
+      "context_length": 1048576
+    }
+  ]
+}
+```
+
+`created` is the time the Gateway process started. Every entry carries the same
+large `context_length` and `is_multimodal: false`: clients such as Conduit fall
+back to a 4096-token window when the length is missing, and treat a missing flag
+as multimodal. `description` is left out when the model has none.
 
 ---
 
