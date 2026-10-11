@@ -392,11 +392,9 @@ class StreamTranslator:
         """When ``tick()`` next has something to do, on the clock ``now`` is read from."""
         if self._closed or not self._started:
             return None
-        deadlines = [self._last_output_at + SILENCE_NOTICE_SECONDS]
-        message = self._message
-        if message is not None and message.mode == "undecided" and message.held:
-            deadlines.append(message.held_since + NARRATION_HOLD_SECONDS)
-        return min(deadlines)
+        hold = self._hold_deadline()
+        silence = self._silence_deadline()
+        return silence if hold is None else min(hold, silence)
 
     def finish(self, *, now: float, usage: Usage | None = None, failure: InBandError | None = None, stored: str | None = None) -> list[Output]:
         """End the stream after ``end``, once the run's final status is known.
@@ -586,16 +584,33 @@ class StreamTranslator:
             return self._emit_reasoning(text)
         return self._emit_message_content(message, text)
 
-    def _expire_hold(self) -> list[Output]:
+    def _hold_deadline(self) -> float | None:
+        """When the current message's held text is due as ``content``, or None when it holds none.
+
+        ``next_deadline()`` and ``tick()`` compare the clock with this one sum. An elapsed time
+        can round below the hold (1.4 - 0.4 is 0.9999999999999999), and a tick at the reported
+        deadline would then do nothing.
+        """
         message = self._message
-        if message is not None and message.mode == "undecided" and message.held and self._now - message.held_since >= NARRATION_HOLD_SECONDS:
-            return self._release(message, "content")
-        return []
+        if message is None or message.mode != "undecided" or not message.held:
+            return None
+        return message.held_since + NARRATION_HOLD_SECONDS
+
+    def _silence_deadline(self) -> float:
+        """When the still-working notice is due; one sum for the reason ``_hold_deadline`` gives."""
+        return self._last_output_at + SILENCE_NOTICE_SECONDS
+
+    def _expire_hold(self) -> list[Output]:
+        message, deadline = self._message, self._hold_deadline()
+        if message is None or deadline is None or self._now < deadline:
+            return []
+        return self._release(message, "content")
 
     def _silence_notice(self) -> list[Output]:
-        if not self._started or self._now - self._last_output_at < SILENCE_NOTICE_SECONDS:
+        if not self._started or self._now < self._silence_deadline():
             return []
-        minutes = max(1, int((self._now - self._last_real_output_at) // 60))
+        # Rounded to the microsecond: 128.2 - 8.2 is 119.99999999999999, two minutes all the same.
+        minutes = max(1, int(round(self._now - self._last_real_output_at, 6) // 60))
         return self._emit_line(f"Still working... ({minutes} min)", real=False)
 
     def _fail(self, error: InBandError) -> list[Output]:
