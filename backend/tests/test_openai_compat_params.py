@@ -294,6 +294,14 @@ def test_the_header_names_at_most_twenty_parameters():
     assert ignored_params_header(names).split(", ") == names[:20]
 
 
+def test_the_header_stops_reading_names_once_it_has_twenty():
+    def names():
+        yield from (f"p{index}" for index in range(MAX_IGNORED_NAMES))
+        raise AssertionError("read past the twentieth name")
+
+    assert ignored_params_header(names()).split(", ") == [f"p{index}" for index in range(MAX_IGNORED_NAMES)]
+
+
 def test_names_are_cut_to_header_safe_characters_and_a_sane_length():
     assert safe_name("messages[].name") == "messages[].name"
     assert safe_name("a b,c\n") == "a_b_c_"
