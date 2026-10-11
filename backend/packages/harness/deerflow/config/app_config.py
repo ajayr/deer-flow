@@ -32,6 +32,7 @@ from deerflow.config.loop_detection_config import LoopDetectionConfig
 from deerflow.config.mcp_tasks_config import McpTasksConfig
 from deerflow.config.memory_config import MemoryConfig, load_memory_config_from_dict
 from deerflow.config.model_config import ModelConfig
+from deerflow.config.openai_compat_config import OpenAICompatConfig
 from deerflow.config.pii_redaction_config import PiiRedactionConfig
 from deerflow.config.projects_config import ProjectsConfig
 from deerflow.config.prompt_overlay import PromptOverlay
@@ -296,6 +297,10 @@ class AppConfig(BaseModel):
         description="Provider-agnostic knowledge capability and custom-agent scope-selection configuration",
     )
     agents_api: AgentsApiConfig = Field(default_factory=AgentsApiConfig, description="Custom-agent management API configuration")
+    openai_compat: OpenAICompatConfig = Field(
+        default_factory=OpenAICompatConfig,
+        description="OpenAI-compatible HTTP API (/api/openai/v1) configuration. Off by default; only `enabled` needs a restart.",
+    )
     acp_agents: dict[str, ACPAgentConfig] = Field(default_factory=dict, description="ACP-compatible agent configuration")
     subagents: SubagentsAppConfig = Field(default_factory=SubagentsAppConfig, description="Subagent runtime configuration")
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig, description="Guardrail middleware configuration")
