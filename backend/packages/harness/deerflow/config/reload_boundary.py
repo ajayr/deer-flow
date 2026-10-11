@@ -100,6 +100,10 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
         "(app.gateway.auth.login_throttle); the store (in-process counter or the shared login_throttle table) is not rebuilt on "
         "config.yaml edits, so switching it needs a Gateway restart. auth.local.max_login_attempts and lockout_seconds stay live-read."
     ),
+    "openai_compat.enabled": (
+        "create_app() mounts the OpenAI-compatible router (/api/openai/v1) once at startup, and only when this flag is true; "
+        "a freshly reloaded AppConfig neither adds nor removes routes, so toggling it needs a Gateway restart. openai_compat.default_mode and openai_compat.modes stay live-read."
+    ),
     "projects.summaries_enabled": (
         "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
     ),

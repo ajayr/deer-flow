@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from deerflow.config.app_config import AppConfig
+from deerflow.config.openai_compat_config import OpenAICompatConfig
 from deerflow.config.reload_boundary import (
     STARTUP_ONLY_FIELDS,
     STARTUP_ONLY_PREFIX,
@@ -123,6 +124,19 @@ def test_skills_container_path_is_registered_as_startup_only():
     description = SkillsConfig.model_fields["container_path"].description or ""
     assert description.startswith(STARTUP_ONLY_PREFIX)
     assert STARTUP_ONLY_FIELDS[field_path] in description
+
+
+def test_openai_compat_enabled_is_registered_as_startup_only():
+    """create_app() mounts the OpenAI-compatible router once; the rest of the section is read per request."""
+    field_path = "openai_compat.enabled"
+    assert field_path in STARTUP_ONLY_FIELDS
+    description = OpenAICompatConfig.model_fields["enabled"].description or ""
+    assert description.startswith(STARTUP_ONLY_PREFIX)
+    assert STARTUP_ONLY_FIELDS[field_path] in description
+    for live_field in ("default_mode", "modes"):
+        assert not (OpenAICompatConfig.model_fields[live_field].description or "").startswith(STARTUP_ONLY_PREFIX)
+    # The registered path is the nested leaf, so the section field itself must not carry the prefix.
+    assert not (AppConfig.model_fields["openai_compat"].description or "").startswith(STARTUP_ONLY_PREFIX)
 
 
 def test_no_appconfig_field_uses_prefix_without_registration():
