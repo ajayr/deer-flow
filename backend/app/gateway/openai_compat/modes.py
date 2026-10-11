@@ -1,4 +1,4 @@
-"""Model catalogue for the OpenAI-compatible API: the ``<model>`` and ``<model>:<mode>`` ids a caller can pick.
+"""Models and modes for the OpenAI-compatible API: the ``<model>`` and ``<model>:<mode>`` ids a caller can pick, and what a pick means for a run.
 
 Pure: no FastAPI, no I/O. The router passes in the models the caller may use
 (already filtered by model authorization) and the ``openai_compat`` settings.
@@ -6,10 +6,11 @@ Pure: no FastAPI, no I/O. The router passes in the models the caller may use
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
+from app.gateway.openai_compat.errors import model_not_found, quote, unsupported_value
 from deerflow.config.openai_compat_config import OPENAI_COMPAT_MODES, OpenAICompatMode
 
 #: ``context_length`` advertised for every entry. Deliberately not a model's real
@@ -31,6 +32,18 @@ _MODES_BY_THINKING: dict[str, tuple[OpenAICompatMode, ...]] = {
 
 
 @dataclass(frozen=True, slots=True)
+class EffortFacts:
+    """A model's reasoning-effort control: the values a caller may send."""
+
+    #: The contract's values, then the keys of its aliases.
+    accepted: tuple[str, ...]
+
+    @classmethod
+    def of(cls, values: Iterable[str], aliases: Iterable[str] = ()) -> EffortFacts:
+        return cls(accepted=tuple(dict.fromkeys([*values, *aliases])))
+
+
+@dataclass(frozen=True, slots=True)
 class ModelFacts:
     """What the catalogue needs to know about one model the caller may use."""
 
@@ -38,6 +51,8 @@ class ModelFacts:
     display_name: str | None
     description: str | None
     thinking: Thinking
+    #: ``None`` when the model has no effort control.
+    effort: EffortFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +64,26 @@ class CatalogueEntry:
     description: str | None
     model_name: str
     mode: OpenAICompatMode
+    effort: EffortFacts | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModeFlags:
+    """What a mode switches on for a run, as the web UI does (``frontend/src/core/threads/hooks.ts``)."""
+
+    thinking: bool
+    plan: bool
+    subagents: bool
+    #: The ``reasoning_effort`` sent when the request names none; ``None`` sends nothing.
+    default_effort: str | None
+
+
+MODE_FLAGS: dict[OpenAICompatMode, ModeFlags] = {
+    "flash": ModeFlags(thinking=False, plan=False, subagents=False, default_effort=None),
+    "thinking": ModeFlags(thinking=True, plan=False, subagents=False, default_effort="low"),
+    "pro": ModeFlags(thinking=True, plan=True, subagents=False, default_effort="medium"),
+    "ultra": ModeFlags(thinking=True, plan=True, subagents=True, default_effort="high"),
+}
 
 
 def offered_modes(thinking: str, configured_modes: Sequence[OpenAICompatMode]) -> tuple[OpenAICompatMode, ...]:
@@ -106,12 +141,68 @@ def build_catalogue(
         if bare is None:
             continue
         label = model.display_name or model.name
-        entries.append(CatalogueEntry(id=model.name, name=label, description=model.description, model_name=model.name, mode=bare))
+        entries.append(CatalogueEntry(id=model.name, name=label, description=model.description, model_name=model.name, mode=bare, effort=model.effort))
         if len(offered) < 2:
             continue
         for mode in offered:
             variant_id = f"{model.name}:{mode}"
             if variant_id in reserved:
                 continue
-            entries.append(CatalogueEntry(id=variant_id, name=f"{label} ({mode})", description=model.description, model_name=model.name, mode=mode))
+            entries.append(CatalogueEntry(id=variant_id, name=f"{label} ({mode})", description=model.description, model_name=model.name, mode=mode, effort=model.effort))
     return entries
+
+
+def resolve_model(model_id: str, catalogue: Sequence[CatalogueEntry]) -> CatalogueEntry:
+    """The entry whose id is ``model_id``.
+
+    The list is the contract: only an id that ``GET /models`` lists for the caller resolves,
+    so a model whose own name contains a colon works and a hidden model looks like a missing one.
+    Anything else is a 404 that names the ids that do exist (cut to the message limit).
+    """
+    for entry in catalogue:
+        if entry.id == model_id:
+            return entry
+    available = ", ".join(entry.id for entry in catalogue) or "none"
+    raise model_not_found(f"The model {quote(model_id)} does not exist or is not available to you. Available: {available}.")
+
+
+@dataclass(frozen=True, slots=True)
+class EffortDecision:
+    """The ``reasoning_effort`` a run gets and whether the request's own value was set aside."""
+
+    value: str | None
+    #: True when the request named an effort that had no effect: the variant has thinking off or the model has no effort control.
+    ignored: bool = False
+
+
+def decide_effort(entry: CatalogueEntry, requested: str | None) -> EffortDecision:
+    """Apply the ``reasoning_effort`` rules of the design (section 5.4) to one request.
+
+    No value requested: the mode's default, for a model that has an effort control. A value
+    requested for a mode with thinking off, or for a model with no control, is set aside and
+    reported. Any other value must be one the model accepts, or it is a 400. The Gateway's
+    resolver then maps what is sent through the model's contract, as it does for the web UI.
+    """
+    effort = entry.effort
+    flags = MODE_FLAGS[entry.mode]
+    if requested is None:
+        return EffortDecision(value=flags.default_effort if effort is not None else None)
+    if effort is None or not flags.thinking:
+        return EffortDecision(value=None, ignored=True)
+    if requested not in effort.accepted:
+        raise unsupported_value("reasoning_effort", f"Value {quote(requested)} is not supported for {quote(entry.id)}. Accepted: {', '.join(effort.accepted)}.")
+    return EffortDecision(value=requested)
+
+
+def run_context(entry: CatalogueEntry, reasoning_effort: str | None) -> dict[str, Any]:
+    """The context of the run for one request: exactly the keys the web UI sets for a mode, and nothing from the client."""
+    flags = MODE_FLAGS[entry.mode]
+    context: dict[str, Any] = {
+        "model_name": entry.model_name,
+        "thinking_enabled": flags.thinking,
+        "is_plan_mode": flags.plan,
+        "subagent_enabled": flags.subagents,
+    }
+    if reasoning_effort is not None:
+        context["reasoning_effort"] = reasoning_effort
+    return context
