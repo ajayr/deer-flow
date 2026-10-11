@@ -1,0 +1,322 @@
+{
+ "events": [
+  {
+   "data": {
+    "run_id": "run-1",
+    "thread_id": "thread-1"
+   },
+   "event": "metadata"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "I need to check something first.",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "",
+       "id": "call_clar_1",
+       "index": 0,
+       "name": "ask_clarification",
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {},
+       "id": "call_clar_1",
+       "name": "ask_clarification",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "{\"question\": \"Which environment?\", \"clarification_type\": \"approach_choice\", \"options\": [\"staging\", \"production\"]}",
+       "id": null,
+       "index": 0,
+       "name": null,
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {
+        "clarification_type": "approach_choice",
+        "options": [
+         "staging",
+         "production"
+        ],
+        "question": "Which environment?"
+       },
+       "id": null,
+       "name": "",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": "last",
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {
+      "finish_reason": "tool_calls",
+      "model_name": "scripted"
+     },
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": {
+      "input_tokens": 12,
+      "output_tokens": 4,
+      "total_tokens": 16
+     }
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "artifact": {
+      "human_input": {
+       "clarification_type": "approach_choice",
+       "input_mode": "choice_with_other",
+       "kind": "human_input_request",
+       "options": [
+        {
+         "id": "option-1",
+         "label": "staging",
+         "value": "staging"
+        },
+        {
+         "id": "option-2",
+         "label": "production",
+         "value": "production"
+        }
+       ],
+       "question": "Which environment?",
+       "request_id": "clarification:call_clar_1",
+       "source": "ask_clarification",
+       "tool_call_id": "call_clar_1",
+       "version": 1
+      }
+     },
+     "content": "🔀 Which environment?\n\n  1. staging\n  2. production",
+     "id": "clarification:call_clar_1",
+     "name": "ask_clarification",
+     "response_metadata": {},
+     "status": "success",
+     "tool_call_id": "call_clar_1",
+     "type": "tool"
+    },
+    {
+     "langgraph_checkpoint_ns": "tools:uuid-2",
+     "langgraph_node": "tools",
+     "langgraph_path": [
+      "__pregel_push",
+      0,
+      false
+     ],
+     "langgraph_step": 3,
+     "langgraph_triggers": [
+      "__pregel_push"
+     ],
+     "ls_integration": "langchain_create_agent",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": null,
+   "event": "end"
+  }
+ ],
+ "prompt": "Deploy it.",
+ "turn_messages": [
+  {
+   "additional_kwargs": {},
+   "content": "I need to check something first.",
+   "id": "ai-1",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {
+    "finish_reason": "tool_calls",
+    "model_name": "scripted"
+   },
+   "tool_calls": [
+    {
+     "args": {
+      "clarification_type": "approach_choice",
+      "options": [
+       "staging",
+       "production"
+      ],
+      "question": "Which environment?"
+     },
+     "id": "call_clar_1",
+     "name": "ask_clarification",
+     "type": "tool_call"
+    }
+   ],
+   "type": "ai",
+   "usage_metadata": {
+    "input_tokens": 12,
+    "output_tokens": 4,
+    "total_tokens": 16
+   }
+  },
+  {
+   "additional_kwargs": {},
+   "artifact": {
+    "human_input": {
+     "clarification_type": "approach_choice",
+     "input_mode": "choice_with_other",
+     "kind": "human_input_request",
+     "options": [
+      {
+       "id": "option-1",
+       "label": "staging",
+       "value": "staging"
+      },
+      {
+       "id": "option-2",
+       "label": "production",
+       "value": "production"
+      }
+     ],
+     "question": "Which environment?",
+     "request_id": "clarification:call_clar_1",
+     "source": "ask_clarification",
+     "tool_call_id": "call_clar_1",
+     "version": 1
+    }
+   },
+   "content": "🔀 Which environment?\n\n  1. staging\n  2. production",
+   "id": "clarification:call_clar_1",
+   "name": "ask_clarification",
+   "response_metadata": {},
+   "status": "success",
+   "tool_call_id": "call_clar_1",
+   "type": "tool"
+  }
+ ]
+}

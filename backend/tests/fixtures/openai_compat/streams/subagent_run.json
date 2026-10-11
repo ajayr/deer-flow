@@ -1,0 +1,406 @@
+{
+ "events": [
+  {
+   "data": {
+    "run_id": "run-1",
+    "thread_id": "thread-1"
+   },
+   "event": "metadata"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "Delegating.",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "",
+       "id": "call_task",
+       "index": 0,
+       "name": "task",
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {},
+       "id": "call_task",
+       "name": "task",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "{\"description\": \"find the answer\", \"prompt\": \"What is 6 x 7?\", \"subagent_type\": \"general-purpose\"}",
+       "id": null,
+       "index": 0,
+       "name": null,
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {
+        "description": "find the answer",
+        "prompt": "What is 6 x 7?",
+        "subagent_type": "general-purpose"
+       },
+       "id": null,
+       "name": "",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": "last",
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {
+      "finish_reason": "tool_calls",
+      "model_name": "scripted"
+     },
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": {
+      "input_tokens": 12,
+      "output_tokens": 4,
+      "total_tokens": 16
+     }
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": {
+    "description": "find the answer",
+    "model_name": "scripted",
+    "task_id": "call_task",
+    "type": "task_started"
+   },
+   "event": "custom"
+  },
+  {
+   "data": {
+    "message": {
+     "additional_kwargs": {},
+     "content": "Working on it.",
+     "id": "sub-ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_calls": [],
+     "type": "ai",
+     "usage_metadata": null
+    },
+    "message_index": 1,
+    "model_name": "scripted",
+    "task_id": "call_task",
+    "total_messages": 1,
+    "type": "task_running",
+    "usage": null
+   },
+   "event": "custom"
+  },
+  {
+   "data": {
+    "model_name": "scripted",
+    "result": "42",
+    "task_id": "call_task",
+    "type": "task_completed",
+    "usage": null
+   },
+   "event": "custom"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "artifact": null,
+     "content": "Task Succeeded. Result: 42",
+     "id": "uuid-2",
+     "name": "task",
+     "response_metadata": {},
+     "status": "success",
+     "tool_call_id": "call_task",
+     "type": "tool"
+    },
+    {
+     "langgraph_checkpoint_ns": "tools:uuid-3",
+     "langgraph_node": "tools",
+     "langgraph_path": [
+      "__pregel_push",
+      0,
+      false
+     ],
+     "langgraph_step": 2,
+     "langgraph_triggers": [
+      "__pregel_push"
+     ],
+     "ls_integration": "langchain_create_agent",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "The subagent says 42.",
+     "id": "ai-2",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-4",
+     "langgraph_checkpoint_ns": "model:uuid-4",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 3,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": "last",
+     "content": "",
+     "id": "ai-2",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {
+      "finish_reason": "stop",
+      "model_name": "scripted"
+     },
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": {
+      "input_tokens": 12,
+      "output_tokens": 4,
+      "total_tokens": 16
+     }
+    },
+    {
+     "checkpoint_ns": "model:uuid-4",
+     "langgraph_checkpoint_ns": "model:uuid-4",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 3,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": null,
+   "event": "end"
+  }
+ ],
+ "prompt": "Ask a subagent for the answer.",
+ "turn_messages": [
+  {
+   "additional_kwargs": {},
+   "content": "Delegating.",
+   "id": "ai-1",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {
+    "finish_reason": "tool_calls",
+    "model_name": "scripted"
+   },
+   "tool_calls": [
+    {
+     "args": {
+      "description": "find the answer",
+      "prompt": "What is 6 x 7?",
+      "subagent_type": "general-purpose"
+     },
+     "id": "call_task",
+     "name": "task",
+     "type": "tool_call"
+    }
+   ],
+   "type": "ai",
+   "usage_metadata": {
+    "input_tokens": 12,
+    "output_tokens": 4,
+    "total_tokens": 16
+   }
+  },
+  {
+   "additional_kwargs": {},
+   "artifact": null,
+   "content": "Task Succeeded. Result: 42",
+   "id": "uuid-2",
+   "name": "task",
+   "response_metadata": {},
+   "status": "success",
+   "tool_call_id": "call_task",
+   "type": "tool"
+  },
+  {
+   "additional_kwargs": {},
+   "content": "The subagent says 42.",
+   "id": "ai-2",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {
+    "finish_reason": "stop",
+    "model_name": "scripted"
+   },
+   "tool_calls": [],
+   "type": "ai",
+   "usage_metadata": {
+    "input_tokens": 12,
+    "output_tokens": 4,
+    "total_tokens": 16
+   }
+  }
+ ]
+}

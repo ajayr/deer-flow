@@ -1,0 +1,224 @@
+{
+ "events": [
+  {
+   "data": {
+    "run_id": "run-1",
+    "thread_id": "thread-1"
+   },
+   "event": "metadata"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {
+      "reasoning_content": "Add the "
+     },
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {
+      "reasoning_content": "numbers."
+     },
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "Four",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": ".",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": "last",
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {
+      "finish_reason": "stop",
+      "model_name": "scripted"
+     },
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": {
+      "input_tokens": 12,
+      "output_tokens": 4,
+      "total_tokens": 16
+     }
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": null,
+   "event": "end"
+  }
+ ],
+ "prompt": "What is 2 + 2?",
+ "turn_messages": [
+  {
+   "additional_kwargs": {
+    "reasoning_content": "Add the numbers."
+   },
+   "content": "Four.",
+   "id": "ai-1",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {
+    "finish_reason": "stop",
+    "model_name": "scripted"
+   },
+   "tool_calls": [],
+   "type": "ai",
+   "usage_metadata": {
+    "input_tokens": 12,
+    "output_tokens": 4,
+    "total_tokens": 16
+   }
+  }
+ ]
+}

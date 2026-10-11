@@ -1,0 +1,80 @@
+{
+ "events": [
+  {
+   "data": {
+    "run_id": "run-1",
+    "thread_id": "thread-1"
+   },
+   "event": "metadata"
+  },
+  {
+   "data": {
+    "attempt": 1,
+    "max_attempts": 2,
+    "message": "LLM request retry 1/2: provider request failed temporarily. Retrying in 1s.",
+    "reason": "transient",
+    "type": "llm_retry",
+    "wait_ms": 1
+   },
+   "event": "custom"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {
+      "deerflow_error_fallback": true,
+      "error_detail": "Connection error.",
+      "error_reason": "transient",
+      "error_type": "APIConnectionError"
+     },
+     "content": "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation.",
+     "id": "uuid-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_calls": [],
+     "type": "ai",
+     "usage_metadata": null
+    },
+    {
+     "langgraph_checkpoint_ns": "model:uuid-2",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_create_agent",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": null,
+   "event": "end"
+  }
+ ],
+ "prompt": "Say hello.",
+ "turn_messages": [
+  {
+   "additional_kwargs": {
+    "deerflow_error_fallback": true,
+    "error_detail": "Connection error.",
+    "error_reason": "transient",
+    "error_type": "APIConnectionError"
+   },
+   "content": "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation.",
+   "id": "uuid-1",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {},
+   "tool_calls": [],
+   "type": "ai",
+   "usage_metadata": null
+  }
+ ]
+}

@@ -1,0 +1,205 @@
+{
+ "events": [
+  {
+   "data": {
+    "run_id": "run-1",
+    "thread_id": "thread-1"
+   },
+   "event": "metadata"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "",
+       "id": "call_1",
+       "index": 0,
+       "name": "web_search",
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {},
+       "id": "call_1",
+       "name": "web_search",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": null,
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {},
+     "tool_call_chunks": [
+      {
+       "args": "{\"query\": \"par",
+       "id": null,
+       "index": 0,
+       "name": null,
+       "type": "tool_call_chunk"
+      }
+     ],
+     "tool_calls": [
+      {
+       "args": {
+        "query": "par"
+       },
+       "id": null,
+       "name": "",
+       "type": "tool_call"
+      }
+     ],
+     "type": "AIMessageChunk",
+     "usage_metadata": null
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": [
+    {
+     "additional_kwargs": {},
+     "chunk_position": "last",
+     "content": "",
+     "id": "ai-1",
+     "invalid_tool_calls": [],
+     "name": null,
+     "response_metadata": {
+      "finish_reason": "content_filter",
+      "model_name": "scripted"
+     },
+     "tool_call_chunks": [],
+     "tool_calls": [],
+     "type": "AIMessageChunk",
+     "usage_metadata": {
+      "input_tokens": 12,
+      "output_tokens": 4,
+      "total_tokens": 16
+     }
+    },
+    {
+     "checkpoint_ns": "model:uuid-1",
+     "langgraph_checkpoint_ns": "model:uuid-1",
+     "langgraph_node": "model",
+     "langgraph_path": [
+      "__pregel_pull",
+      "model"
+     ],
+     "langgraph_step": 1,
+     "langgraph_triggers": [
+      "branch:to:model"
+     ],
+     "ls_integration": "langchain_chat_model",
+     "ls_model_type": "chat",
+     "ls_provider": "scriptedchatmodel",
+     "thread_id": "thread-1"
+    }
+   ],
+   "event": "messages"
+  },
+  {
+   "data": {
+    "detector": "openai_compatible_content_filter",
+    "reason_field": "finish_reason",
+    "reason_value": "content_filter",
+    "suppressed_tool_call_count": 1,
+    "suppressed_tool_call_names": [
+     "web_search"
+    ],
+    "thread_id": null,
+    "type": "safety_termination"
+   },
+   "event": "custom"
+  },
+  {
+   "data": null,
+   "event": "end"
+  }
+ ],
+ "prompt": "Write that file.",
+ "turn_messages": [
+  {
+   "additional_kwargs": {
+    "safety_termination": {
+     "detector": "openai_compatible_content_filter",
+     "extras": {},
+     "reason_field": "finish_reason",
+     "reason_value": "content_filter",
+     "suppressed_tool_call_count": 1,
+     "suppressed_tool_call_names": [
+      "web_search"
+     ]
+    }
+   },
+   "content": "The model provider stopped this response with a safety-related signal (finish_reason='content_filter', detector='openai_compatible_content_filter'). Any tool calls produced in this turn were suppressed because their arguments may be truncated and unsafe to execute. Please rephrase the request or ask for a narrower output.",
+   "id": "ai-1",
+   "invalid_tool_calls": [],
+   "name": null,
+   "response_metadata": {
+    "finish_reason": "content_filter",
+    "model_name": "scripted"
+   },
+   "tool_calls": [],
+   "type": "ai",
+   "usage_metadata": {
+    "input_tokens": 12,
+    "output_tokens": 4,
+    "total_tokens": 16
+   }
+  }
+ ]
+}
