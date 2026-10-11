@@ -148,6 +148,16 @@ def _make_pat_app(with_pat_repo: bool = True):
     async def openai_models(request: Request):
         return {"object": "list", "data": []}
 
+    # Mirrors the real OpenAI-compatible chat completion: it starts a run and creates and
+    # updates the caller's threads, so it needs all four scopes at the decorators.
+    @app.post("/api/openai/v1/chat/completions")
+    @require_permission("runs", "create")
+    @require_permission("runs", "read")
+    @require_permission("threads", "read")
+    @require_permission("threads", "write")
+    async def openai_chat_completions(request: Request):
+        return {"object": "chat.completion"}
+
     return app
 
 
@@ -668,6 +678,7 @@ def test_pat_openai_compat_policy_admits_exactly_the_mounted_routes():
             assert is_pat_allowed_route(method, route.path), f"{method} {route.path} is implemented but PAT-denied"
 
     assert is_pat_allowed_route("GET", "/api/openai/v1/models/") is True
+    assert is_pat_allowed_route("POST", "/api/openai/v1/chat/completions/") is True
     for method, path in [
         ("POST", "/api/openai/v1/models"),
         ("DELETE", "/api/openai/v1/models"),
@@ -677,6 +688,13 @@ def test_pat_openai_compat_policy_admits_exactly_the_mounted_routes():
         ("GET", "/api/openai/v2/models"),
         ("GET", "/api/openai/v1/embeddings"),
         ("POST", "/api/openai/v1/completions"),
+        ("GET", "/api/openai/v1/chat/completions"),
+        ("PUT", "/api/openai/v1/chat/completions"),
+        ("DELETE", "/api/openai/v1/chat/completions"),
+        ("POST", "/api/openai/v1/chat"),
+        ("POST", "/api/openai/v1/chat/completions/abc"),
+        ("POST", "/api/openai/v2/chat/completions"),
+        ("POST", "/api/openai/chat/completions"),
     ]:
         assert not is_pat_allowed_route(method, path), f"{method} {path} is not implemented and must stay denied"
 
@@ -700,6 +718,26 @@ def test_pat_without_runs_create_cannot_list_openai_models(client):
 def test_openai_models_listing_requires_authentication(client):
     client.cookies.clear()
     assert client.get("/api/openai/v1/models").status_code == 401
+
+
+CHAT_COMPLETION_SCOPES = ["runs:create", "runs:read", "threads:read", "threads:write"]
+
+
+def test_pat_with_the_four_chat_scopes_can_create_a_chat_completion(client):
+    created = _create_pat(client, scopes=CHAT_COMPLETION_SCOPES)
+    client.cookies.clear()
+    response = client.post("/api/openai/v1/chat/completions", headers={"Authorization": f"Bearer {created['token']}"})
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("missing", CHAT_COMPLETION_SCOPES)
+def test_pat_missing_a_chat_scope_cannot_create_a_chat_completion(client, missing):
+    """Each scope is enforced at its own decorator, so dropping any one is a 403 that names it."""
+    created = _create_pat(client, scopes=[scope for scope in CHAT_COMPLETION_SCOPES if scope != missing])
+    client.cookies.clear()
+    response = client.post("/api/openai/v1/chat/completions", headers={"Authorization": f"Bearer {created['token']}"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Permission denied: {missing}"
 
 
 def test_runs_read_only_pat_cannot_cancel_then_stream(client):
