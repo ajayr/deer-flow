@@ -581,7 +581,8 @@ class StreamTranslator:
         message.mode = mode
         text, message.held, message.held_chars = "".join(message.held), [], 0
         if mode == "reasoning":
-            return self._emit_reasoning(text)
+            # Narration after reasoning that ends mid-line starts a paragraph of its own.
+            return self._emit_reasoning(("\n\n" if text and self._reasoning_mid_line else "") + text)
         return self._emit_message_content(message, text)
 
     def _hold_deadline(self) -> float | None:
