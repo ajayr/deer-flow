@@ -110,3 +110,6 @@ class InBandError:
 
 RUN_ERROR = InBandError("run_error", "The model provider failed while answering. Send the message again to retry.")
 EMPTY_RESPONSE = InBandError("empty_response", "The agent finished without producing an answer. Send the message again to retry.")
+RUN_INTERRUPTED = InBandError("run_interrupted", "The run was stopped before it finished. Send the message again to retry.")
+STREAM_GAP = InBandError("stream_gap", "Part of the answer was lost on its way to you. Send the message again to retry.")
+INTERNAL_ERROR = InBandError("internal_error", "The server hit an unexpected error while answering. Send the message again to retry.")

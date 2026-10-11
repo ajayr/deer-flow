@@ -9,9 +9,12 @@ import pytest
 
 from app.gateway.openai_compat.errors import (
     EMPTY_RESPONSE,
+    INTERNAL_ERROR,
     MAX_MESSAGE_CHARS,
     MAX_QUOTED_CHARS,
     RUN_ERROR,
+    RUN_INTERRUPTED,
+    STREAM_GAP,
     InBandError,
     OpenAIError,
     context_length_exceeded,
@@ -23,6 +26,7 @@ from app.gateway.openai_compat.errors import (
     unsupported_parameter,
     unsupported_value,
 )
+from app.gateway.openai_compat.schemas import ErrorResponse
 
 # ── the envelope ─────────────────────────────────────────────────────────────
 
@@ -35,6 +39,28 @@ def test_an_error_body_is_the_openai_envelope():
 
 def test_an_error_without_a_param_says_null():
     assert OpenAIError(400, "invalid_request", "Bad.").body()["error"]["param"] is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        invalid_request("m", param="model"),
+        unsupported_parameter("p", "m"),
+        unsupported_value("p", "m"),
+        invalid_message("m"),
+        context_length_exceeded("m"),
+        model_not_found("m"),
+        internal_error(),
+        RUN_ERROR,
+        EMPTY_RESPONSE,
+        RUN_INTERRUPTED,
+        STREAM_GAP,
+        INTERNAL_ERROR,
+    ],
+)
+def test_every_error_body_is_the_envelope_the_api_documents(error):
+    """``ErrorResponse`` is what the OpenAPI schema and the API reference promise; no error may say anything else."""
+    assert ErrorResponse.model_validate(error.body()).model_dump() == error.body()
 
 
 def test_the_exception_text_is_the_client_message():
@@ -144,7 +170,10 @@ def test_an_in_band_error_cannot_be_changed_after_it_is_built():
         RUN_ERROR.message = "changed"  # type: ignore[misc]
 
 
-@pytest.mark.parametrize(("error", "code"), [(RUN_ERROR, "run_error"), (EMPTY_RESPONSE, "empty_response")])
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [(RUN_ERROR, "run_error"), (EMPTY_RESPONSE, "empty_response"), (RUN_INTERRUPTED, "run_interrupted"), (STREAM_GAP, "stream_gap"), (INTERNAL_ERROR, "internal_error")],
+)
 def test_the_fixed_in_band_errors_fit_a_client_and_leak_nothing(error, code):
     assert error.code == code
     assert len(error.message) <= MAX_MESSAGE_CHARS
