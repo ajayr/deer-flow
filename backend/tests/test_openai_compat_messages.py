@@ -152,6 +152,13 @@ def test_an_unknown_part_type_is_quoted_back_briefly():
     assert len(error.message) < 200
 
 
+@pytest.mark.parametrize("kind", [None, ["text"], {"type": "text"}])
+def test_a_part_type_that_is_not_a_string_is_refused_not_crashed_on(kind):
+    error = _refusal([_user([{"type": kind, "text": "hi"}])])
+
+    assert (error.code, error.param) == ("invalid_message", "messages[0].content[0].type")
+
+
 def test_a_part_must_be_an_object_with_text():
     assert _refusal([_user(["hi"])]).param == "messages[0].content[0]"
     assert _refusal([_user([{"type": "text"}])]).param == "messages[0].content[0].text"
