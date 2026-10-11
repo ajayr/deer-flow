@@ -137,7 +137,7 @@ MESSAGE_REJECTED: dict[str, ParamRule] = {rule.name.removeprefix(_MESSAGE_PREFIX
 
 def safe_name(name: str) -> str:
     """A parameter name that is safe to put in a response header."""
-    return _UNSAFE_NAME_CHARS.sub("_", name)[:_MAX_NAME_CHARS]
+    return _UNSAFE_NAME_CHARS.sub("_", name[:_MAX_NAME_CHARS])
 
 
 def ignored_params_header(*groups: Iterable[str]) -> str | None:

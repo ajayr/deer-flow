@@ -7,6 +7,8 @@ drift unnoticed.
 
 from __future__ import annotations
 
+import tracemalloc
+
 import pytest
 
 from app.gateway.openai_compat.errors import OpenAIError
@@ -307,3 +309,16 @@ def test_names_are_cut_to_header_safe_characters_and_a_sane_length():
     assert safe_name("a b,c\n") == "a_b_c_"
     assert safe_name("ünï") == "_n_"
     assert len(safe_name("x" * 100)) == 64
+
+
+def test_making_a_huge_name_safe_reads_only_its_head():
+    name = " " * 5_000_000
+    tracemalloc.start()
+    try:
+        safe = safe_name(name)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert safe == "_" * 64
+    assert peak < 1_000_000
