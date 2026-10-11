@@ -47,7 +47,7 @@ def _history(*pairs: tuple[str, str | None]) -> tuple[Exchange, ...]:
 
 
 def test_normalization_collapses_every_run_of_whitespace_and_trims_the_ends():
-    assert norm("  hello \t\n world  again  ") == "hello world again"
+    assert norm("  hello \t\n world\u00a0 again  ") == "hello world again"
     assert norm("") == ""
     assert norm(" \n ") == ""
 
@@ -65,7 +65,7 @@ def test_different_text_has_a_different_hash():
 
 def test_the_hash_of_non_latin_text_is_taken_over_utf8():
     assert text_hash("モデル") == text_hash("モデル ")
-    assert len(text_hash("モデル")) == 32
+    assert text_hash("モデル") == "94591749a325447bed4fd4de6b483802"
 
 
 # ── exchanges ────────────────────────────────────────────────────────────────

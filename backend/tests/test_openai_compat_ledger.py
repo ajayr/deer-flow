@@ -149,10 +149,10 @@ async def test_candidates_come_most_recently_updated_first(store):
 
 
 async def test_a_pinned_thread_does_not_come_before_a_newer_one(store):
-    await _thread(store, "older", conv=CONV, turns=[_turn("hello")], deerflow_pinned=True)
-    await _thread(store, "newer", conv=CONV, turns=[_turn("hello")])
+    await _thread(store, "t1", conv=CONV, turns=[_turn("hello")], deerflow_pinned=True)
+    await _thread(store, "t2", conv=CONV, turns=[_turn("hello")])
 
-    assert [c.thread_id for c in await find_candidates(store, user_id=USER, conv=CONV)] == ["newer", "older"]
+    assert [c.thread_id for c in await find_candidates(store, user_id=USER, conv=CONV)] == ["t2", "t1"]
 
 
 async def test_only_the_users_own_threads_are_candidates(store):
