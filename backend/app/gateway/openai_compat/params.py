@@ -147,7 +147,9 @@ def ignored_params_header(*groups: Iterable[str]) -> str | None:
         for name in group:
             if name not in names:
                 names.append(name)
-    return ", ".join(names[:MAX_IGNORED_NAMES]) or None
+                if len(names) == MAX_IGNORED_NAMES:
+                    return ", ".join(names)
+    return ", ".join(names) or None
 
 
 @dataclass(frozen=True, slots=True)
