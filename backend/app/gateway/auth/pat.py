@@ -122,6 +122,12 @@ _PAT_ROUTE_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"GET", "POST"}), re.compile(r"^/api/threads/[^/]+/runs/[^/]+/stream$")),
     (frozenset({"POST"}), re.compile(r"^/api/runs/(stream|wait)$")),
     (frozenset({"GET"}), re.compile(r"^/api/runs/[^/]+/(messages|feedback)$")),
+    # OpenAI-compatible API (routers/openai_compat.py, mounted only when
+    # openai_compat.enabled): enumerated per implemented route with the same
+    # no-dead-methods precision. It has no scope of its own: its handlers
+    # require runs:create through ``@require_permission``, so an OpenAI-style
+    # client authenticates with an ordinary PAT.
+    (frozenset({"GET"}), re.compile(r"^/api/openai/v1/models$")),
 )
 
 _BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"

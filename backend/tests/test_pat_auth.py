@@ -141,6 +141,13 @@ def _make_pat_app(with_pat_repo: bool = True):
         require_cancel_permission_if(request, body.multitask_strategy != "reject")
         return {"ok": True}
 
+    # Mirrors the real OpenAI-compatible model listing (routers/openai_compat.py),
+    # which is mounted only when openai_compat.enabled: runs:create at the decorator.
+    @app.get("/api/openai/v1/models")
+    @require_permission("runs", "create")
+    async def openai_models(request: Request):
+        return {"object": "list", "data": []}
+
     return app
 
 
@@ -642,6 +649,55 @@ def test_pat_scopes_enforced_on_stateless_run_entry(client):
     client.cookies.clear()
     allowed = client.post("/api/runs/stream", headers={"Authorization": f"Bearer {create_scope['token']}"})
     assert allowed.status_code == 200
+
+
+def test_pat_openai_compat_policy_admits_exactly_the_mounted_routes():
+    """The OpenAI-compatible router is enumerated like the runs subtree: every
+    method/path it implements is admitted (derived from the router, so a route
+    added later fails here until it is allowlisted), and neighbors it does not
+    implement stay default-denied."""
+    from fastapi.routing import APIRoute
+
+    from app.gateway.auth.pat import is_pat_allowed_route
+    from app.gateway.routers.openai_compat import router
+
+    routes = [route for route in router.routes if isinstance(route, APIRoute)]
+    assert routes
+    for route in routes:
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+            assert is_pat_allowed_route(method, route.path), f"{method} {route.path} is implemented but PAT-denied"
+
+    assert is_pat_allowed_route("GET", "/api/openai/v1/models/") is True
+    for method, path in [
+        ("POST", "/api/openai/v1/models"),
+        ("DELETE", "/api/openai/v1/models"),
+        ("GET", "/api/openai/v1/models/alpha"),
+        ("GET", "/api/openai/v1"),
+        ("GET", "/api/openai/models"),
+        ("GET", "/api/openai/v2/models"),
+    ]:
+        assert not is_pat_allowed_route(method, path), f"{method} {path} is not implemented and must stay denied"
+
+
+def test_pat_with_runs_create_can_list_openai_models(client):
+    created = _create_pat(client, scopes=["runs:create"])
+    client.cookies.clear()
+    response = client.get("/api/openai/v1/models", headers={"Authorization": f"Bearer {created['token']}"})
+    assert response.status_code == 200
+
+
+def test_pat_without_runs_create_cannot_list_openai_models(client):
+    """The route sits inside the PAT allowlist, so the scope is what keeps a read-only token out."""
+    read_only = _create_pat(client, scopes=["threads:read", "runs:read"])
+    client.cookies.clear()
+    response = client.get("/api/openai/v1/models", headers={"Authorization": f"Bearer {read_only['token']}"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Permission denied: runs:create"
+
+
+def test_openai_models_listing_requires_authentication(client):
+    client.cookies.clear()
+    assert client.get("/api/openai/v1/models").status_code == 401
 
 
 def test_runs_read_only_pat_cannot_cancel_then_stream(client):
