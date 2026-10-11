@@ -13,4 +13,11 @@ This package is plain Python: it imports neither FastAPI nor Starlette, and the 
 - A model that offers no mode is not listed; one that offers a single mode is listed by its bare name only.
 - Every entry advertises `ADVERTISED_CONTEXT_LENGTH` and `is_multimodal: false`. Conduit falls back to a 4096-token window when the length is missing and then trims the history it resends, and it treats a missing flag as multimodal. Do not substitute a model's real window.
 
+`translator.py` is the only place that decides what a client sees of a run. It is pure (no I/O, no clock, no FastAPI): the router passes it each stream frame and the current monotonic time. Its docstrings hold the routing rules; `errors.py` holds the fixed in-band error messages, which carry nothing from the failure. Keep these invariants:
+
+- Never forward tool arguments or outputs, human or system messages (hidden memory rides that channel), AI messages from the `tools` node, or frames from nested graphs. Never emit `tool_calls`: Conduit turns it into an error.
+- A stream ends with `[DONE]` or with one in-band error, never both.
+- The streamed `content` should equal `stored_answer()` of the thread's messages, because clients resend it as history. Middleware that rewrites a message after it streamed breaks that, so the router must pass the stored answer to `finish(stored=...)`.
+- `tests/fixtures/openai_compat/streams/` holds hermetic recordings (a scripted model, not the live stack). After a library upgrade, regenerate them with `DEERFLOW_WRITE_FIXTURES=1` and review the diff.
+
 Config lives in `deerflow/config/openai_compat_config.py`. A new key needs `config.example.yaml`, `docs/CONFIGURATION.md` and `tests/test_openai_compat_docs.py` updated together.
