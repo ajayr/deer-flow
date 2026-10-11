@@ -2540,14 +2540,16 @@ agents_api:
 # ============================================================================
 # OpenAI-compatible API
 # ============================================================================
-# Lets OpenAI-style clients (for example the Conduit iOS app in Direct mode) use
-# the agent through /api/openai/v1 with a personal access token (PAT) that
-# carries the `runs:create` scope. Off by default.
+# Serves an OpenAI-style API at /api/openai/v1 for OpenAI-style clients (for
+# example the Conduit iOS app in Direct mode). It currently serves the model
+# listing only (GET /api/openai/v1/models), to a personal access token (PAT)
+# that carries the `runs:create` scope. Off by default.
 #
 # - `enabled` mounts the router once at startup, so changing it needs a Gateway
 #   restart. The other keys are read on every request.
 # - `modes` are offered as <model>:<mode> variants (for example `minimax:pro`).
-#   A model that offers only one mode is listed by its bare name.
+#   A model that offers only one mode is listed by its bare name, and a model
+#   that offers none of `modes` is not listed.
 # - `default_mode` is the mode behind a bare model name. It must be one of
 #   `modes`, so narrow the two together.
 openai_compat:

@@ -1,4 +1,4 @@
-"""OpenAI-compatible API (``/api/openai/v1``): lets OpenAI-style clients, such as Conduit in Direct mode, use the agent.
+"""OpenAI-compatible API (``/api/openai/v1``) for OpenAI-style clients such as Conduit in Direct mode.
 
 ``create_app()`` mounts this router only when ``openai_compat.enabled`` is true.
 Callers authenticate with a personal access token that carries ``runs:create``.
