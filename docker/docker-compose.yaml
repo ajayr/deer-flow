@@ -115,7 +115,18 @@ services:
     # reconnect, but run cancel, request dedup, and per-worker IM channel
     # services remain worker-local. Override GATEWAY_WORKERS only when the
     # Redis stream bridge is enabled and those limitations are acceptable.
-    command: sh -c "cd backend && PYTHONPATH=. uv run --no-sync uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${GATEWAY_WORKERS:-1}"
+    command: sh -c "cd backend && PYTHONPATH=. exec uv run --no-sync uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${GATEWAY_WORKERS:-1} --timeout-graceful-shutdown 10"
+    # Docker's 10s default SIGKILLed the 30s memory queue flush
+    # (memory.shutdown_flush_timeout_seconds) on every restart.
+    stop_grace_period: 90s
+    # `exec` in the command above lets the stop signal reach uvicorn: a `sh -c`
+    # that forks the server stays PID 1 with no SIGTERM handler, the kernel
+    # drops the signal, and the lifespan shutdown never runs; every stop then
+    # waits out stop_grace_period and ends in SIGKILL (#6835). `init` runs
+    # Docker's tini as PID 1: it forwards the signal to uv, which forwards it
+    # to uvicorn, and it reaps orphaned grandchildren, which `sh` used to do
+    # as a side effect of waiting.
+    init: true
     volumes:
       # Fork customization (kept across upgrades; see root CLAUDE.md): config.yaml
       # is served from a read-only DIRECTORY mount of the project root via
